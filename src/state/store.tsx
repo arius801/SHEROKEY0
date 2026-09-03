@@ -1,0 +1,829 @@
+/* SHEROKEY service layer.
+ * In production these functions live in Next.js route handlers/server actions backed by
+ * Drizzle + PostgreSQL. Here they run against a repository adapter (browser persistence)
+ * with the identical contracts: server-side price recalculation, RBAC checks, audit logs,
+ * idempotent webhook processing and transactional key reservation. */
+
+import { useSyncExternalStore } from "react";
+import type {
+  CartItem, Coupon, Currency, DB, DeliveryPayload, Lang, Order, Product, Role, Theme, User,
+} from "../lib/types";
+import { ApiError } from "../lib/types";
+import { buildSeed } from "../lib/seed";
+import { hashPassword, makeSalt, randomToken, uid, verifyPassword } from "../lib/crypto";
+import { convertFromUsd, formatMoney, percentOff } from "../lib/money";
+import { tr, langDir } from "../lib/i18n";
+
+const STORAGE_KEY = "sherokey.workspace.v1";
+const DAY = 86400000;
+
+/* ------------------------------------------------------------------ */
+/* Store core                                                          */
+/* ------------------------------------------------------------------ */
+
+export interface Toast { id: string; msg: string; kind: "ok" | "err" | "info"; }
+
+class Store {
+  db!: DB;
+  ui: { lang: Lang; currency: Currency; theme: Theme; ready: boolean } = {
+    lang: "en", currency: "USD", theme: "dark", ready: false,
+  };
+  toasts: Toast[] = [];
+  v = 0;
+  private listeners = new Set<() => void>();
+
+  subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
+  emit = () => { this.v++; this.listeners.forEach((fn) => fn()); };
+
+  /** mutate() = a database transaction. All writes go through here. */
+  mutate(fn: (db: DB) => void) { fn(this.db); this.persist(); this.emit(); }
+
+  persist() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ db: this.db, ui: { lang: this.ui.lang, currency: this.ui.currency, theme: this.ui.theme } }));
+    } catch { /* storage full/blocked — session continues in memory */ }
+  }
+
+  async init() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        this.db = parsed.db as DB;
+        if (parsed.ui) { this.ui.lang = parsed.ui.lang; this.ui.currency = parsed.ui.currency; this.ui.theme = parsed.ui.theme; }
+      }
+    } catch { /* corrupted — reseed */ }
+    if (!this.db) this.db = await buildSeed();
+    if (this.db.sessionExpires && this.db.sessionExpires < Date.now()) {
+      this.db.sessionUserId = null; this.db.sessionToken = null; this.db.sessionExpires = null;
+    }
+    this.ui.ready = true;
+    this.persist();
+    this.emit();
+  }
+
+  resetWorkspace = async () => {
+    localStorage.removeItem(STORAGE_KEY);
+    this.db = await buildSeed();
+    this.persist(); this.emit();
+  };
+
+  toast = (msg: string, kind: Toast["kind"] = "ok") => {
+    const t = { id: uid("t"), msg, kind };
+    this.toasts = [...this.toasts, t];
+    this.emit();
+    setTimeout(() => { this.toasts = this.toasts.filter((x) => x.id !== t.id); this.emit(); }, 3800);
+  };
+
+  setLang = (lang: Lang) => { this.ui.lang = lang; this.persist(); this.emit(); };
+  setCurrency = (currency: Currency) => { this.ui.currency = currency; this.persist(); this.emit(); };
+  setTheme = (theme: Theme) => { this.ui.theme = theme; this.persist(); this.emit(); };
+}
+
+export const store = new Store();
+
+/* ------------------------------------------------------------------ */
+/* Hooks                                                               */
+/* ------------------------------------------------------------------ */
+
+export function useApp() {
+  useSyncExternalStore(store.subscribe, () => store.v);
+  const lang = store.ui.lang;
+  const currency = store.ui.currency;
+  return {
+    db: store.db,
+    ui: store.ui,
+    toasts: store.toasts,
+    t: (key: string, vars?: Record<string, string | number>) => tr(lang, key, vars),
+    dir: langDir(lang),
+    money: (usdMinor: number, cur?: Currency) =>
+      formatMoney(convertFromUsd(usdMinor, store.db.settings.fx, cur ?? currency), cur ?? currency, lang),
+    fmt: (minor: number, cur: Currency) => formatMoney(minor, cur, lang),
+    user: currentUser(),
+  };
+}
+
+function currentUser(): User | null {
+  const { db } = store;
+  if (!db.sessionUserId || !db.sessionExpires || db.sessionExpires < Date.now()) return null;
+  return db.users.find((u) => u.id === db.sessionUserId) ?? null;
+}
+
+export const isStaff = (u: User | null) => !!u && u.role !== "CUSTOMER";
+export const PERMS = {
+  products: ["OWNER", "ADMIN"], keys: ["OWNER", "ADMIN"], coupons: ["OWNER", "ADMIN"],
+  customers: ["OWNER", "ADMIN"], emails: ["OWNER", "ADMIN"], audit: ["OWNER", "ADMIN"],
+  settings: ["OWNER", "ADMIN"], roles: ["OWNER"],
+  refund: ["OWNER", "ADMIN"], cancel: ["OWNER", "ADMIN"],
+  deliver: ["OWNER", "ADMIN", "SUPPORT"], tickets: ["OWNER", "ADMIN", "SUPPORT"],
+  orders: ["OWNER", "ADMIN", "SUPPORT"],
+} as const;
+export type Perm = keyof typeof PERMS;
+export const can = (u: User | null, perm: Perm) => !!u && (PERMS[perm] as readonly string[]).includes(u.role);
+
+function requireAuth(): User {
+  const u = currentUser();
+  if (!u) throw new ApiError("e.unauthorized");
+  return u;
+}
+function requirePerm(perm: Perm): User {
+  const u = requireAuth();
+  if (!can(u, perm)) throw new ApiError("e.forbidden");
+  return u;
+}
+const staff = (u: User) => u.name;
+
+/* ------------------------------------------------------------------ */
+/* Internals: audit, email, notifications                              */
+/* ------------------------------------------------------------------ */
+
+function audit(db: DB, actor: User, action: string, target: string, meta: string) {
+  db.auditLogs.unshift({ id: uid("al"), actorId: actor.id, actorName: actor.name, action, target, meta, at: Date.now() });
+  if (db.auditLogs.length > 400) db.auditLogs.length = 400;
+}
+
+const MAIL_SUBJECTS: Record<string, string> = {
+  welcome: "mail.subject.welcome", verify: "mail.subject.verify", reset: "mail.subject.reset",
+  order_receipt: "mail.subject.receipt", delivered: "mail.subject.delivered", payment_failed: "mail.subject.failed",
+  refund: "mail.subject.refund", cancelled: "mail.subject.cancelled", processing: "mail.subject.processing",
+  test: "mail.subject.welcome",
+};
+
+function sendEmail(db: DB, to: { email: string; name: string; lang: Lang }, type: string, orderNumber?: string) {
+  db.emailLogs.unshift({
+    id: uid("em"), to: to.email, toName: to.name, type,
+    subject: tr(to.lang, MAIL_SUBJECTS[type] ?? "mail.subject.receipt", { n: orderNumber ?? "" }),
+    lang: to.lang, status: "SENT", provider: db.settings.emailProvider.toLowerCase(), createdAt: Date.now(),
+  });
+}
+
+function notify(db: DB, userId: string, type: string, vars?: Record<string, string>, link?: string) {
+  db.notifications.unshift({ id: uid("nt"), userId, type, vars, link: link ?? null, read: false, createdAt: Date.now() });
+}
+
+/* ------------------------------------------------------------------ */
+/* Pricing engine — the ONLY place totals are computed.                */
+/* Frontend inputs (coupon code, items) are re-validated here.         */
+/* ------------------------------------------------------------------ */
+
+export function availableStock(db: DB, p: Product): number {
+  return p.deliveryMethod === "AUTO" ? db.licenseKeys.filter((k) => k.productId === p.id && k.status === "UNUSED").length : p.stock;
+}
+
+export function validateCoupon(db: DB, code: string, subtotalUsd: number, customerId: string | null, productIds: string[]):
+  { ok: true; coupon: Coupon } | { ok: false; code: string; vars?: Record<string, string> } {
+  const c = db.coupons.find((x) => x.code.toLowerCase() === code.trim().toLowerCase());
+  if (!c || !c.active) return { ok: false, code: "e.couponCode" };
+  const now = Date.now();
+  if (now < c.startsAt || now > c.expiresAt) return { ok: false, code: "e.couponExp" };
+  if (c.uses >= c.maxUses) return { ok: false, code: "e.couponUsed" };
+  if (customerId) {
+    const perCustomer = db.orders.filter((o) => o.customerId === customerId && o.couponCode === c.code && o.paymentStatus !== "FAILED").length;
+    if (perCustomer >= c.maxPerCustomer) return { ok: false, code: "e.couponUsed" };
+  }
+  if (subtotalUsd < c.minOrderUsd)
+    return { ok: false, code: "e.couponMin", vars: { min: formatMoney(c.minOrderUsd, "USD", "en") } };
+  if (c.productIds.length > 0 && !productIds.some((id) => c.productIds.includes(id)))
+    return { ok: false, code: "e.couponCode" };
+  return { ok: true, coupon: c };
+}
+
+export interface Totals {
+  lines: { product: Product; qty: number; unitUsd: number; lineUsd: number }[];
+  subtotalUsd: number; discountUsd: number; taxUsd: number; totalUsd: number;
+  coupon: Coupon | null; couponError: string | null; couponErrorVars?: Record<string, string>;
+  currency: Currency; fxRate: number; totalMinor: number;
+}
+
+export function computeTotals(items: CartItem[], couponCode: string | null, currency: Currency): Totals {
+  const db = store.db;
+  const lines = items.flatMap((it) => {
+    const product = db.products.find((p) => p.id === it.productId);
+    return product && product.active ? [{ product, qty: it.qty, unitUsd: product.priceUsd, lineUsd: product.priceUsd * it.qty }] : [];
+  });
+  const subtotalUsd = lines.reduce((s, l) => s + l.lineUsd, 0);
+  const user = currentUser();
+  let discountUsd = 0;
+  let coupon: Coupon | null = null;
+  let couponError: string | null = null;
+  if (couponCode) {
+    const v = validateCoupon(db, couponCode, subtotalUsd, user?.id ?? null, lines.map((l) => l.product.id));
+    if (v.ok) {
+      coupon = v.coupon;
+      discountUsd = coupon.type === "PERCENT" ? percentOff(subtotalUsd, coupon.value) : Math.min(coupon.value, subtotalUsd);
+    } else { couponError = v.code; }
+  }
+  const couponErrorVars = (() => {
+    if (couponError !== "e.couponMin" || !couponCode) return undefined;
+    const c = db.coupons.find((x) => x.code.toLowerCase() === couponCode.trim().toLowerCase());
+    return c ? { min: formatMoney(c.minOrderUsd, currency, store.ui.lang) } : undefined;
+  })();
+  const taxUsd = Math.round(((subtotalUsd - discountUsd) * db.settings.taxRatePct) / 100);
+  const totalUsd = subtotalUsd - discountUsd + taxUsd;
+  const fxRate = db.settings.fx[currency];
+  return { lines, subtotalUsd, discountUsd, taxUsd, totalUsd, coupon, couponError, couponErrorVars, currency, fxRate, totalMinor: convertFromUsd(totalUsd, db.settings.fx, currency) };
+}
+
+/* ------------------------------------------------------------------ */
+/* Key vault — transactional reservation (production: FOR UPDATE SKIP LOCKED) */
+/* ------------------------------------------------------------------ */
+
+function reserveKeys(db: DB, productId: string, qty: number, orderId: string): string[] {
+  const taken: string[] = [];
+  for (const k of db.licenseKeys) {
+    if (taken.length >= qty) break;
+    if (k.productId === productId && k.status === "UNUSED") {
+      k.status = "RESERVED"; k.orderId = orderId; k.reservedAt = Date.now();
+      taken.push(k.id);
+    }
+  }
+  if (taken.length < qty) {
+    // roll back the partial reservation — keys are never half-sold
+    for (const id of taken) { const k = db.licenseKeys.find((x) => x.id === id)!; k.status = "UNUSED"; k.orderId = null; k.reservedAt = null; }
+    throw new ApiError("e.outOfStock");
+  }
+  return taken;
+}
+
+function releaseReserved(db: DB, orderId: string) {
+  for (const k of db.licenseKeys) if (k.orderId === orderId && k.status === "RESERVED") { k.status = "UNUSED"; k.orderId = null; k.reservedAt = null; }
+}
+
+function deliverReserved(db: DB, order: Order): string[] {
+  const keys: string[] = [];
+  for (const k of db.licenseKeys)
+    if (k.orderId === order.id && k.status === "RESERVED") {
+      k.status = "DELIVERED"; k.deliveredAt = Date.now(); k.customerId = order.customerId;
+      keys.push(k.key);
+    }
+  return keys;
+}
+
+/* ------------------------------------------------------------------ */
+/* Fulfillment — independent from the payment UI. Runs only after a    */
+/* verified provider event.                                            */
+/* ------------------------------------------------------------------ */
+
+function fulfill(db: DB, order: Order) {
+  const hasAuto = order.items.some((i) => i.deliveryMethod === "AUTO");
+  const hasManual = order.items.some((i) => i.deliveryMethod === "MANUAL");
+  if (hasAuto) {
+    const keys = deliverReserved(db, order);
+    for (const it of order.items) if (it.deliveryMethod === "MANUAL") { /* handled by operator */ }
+    order.delivery = { keys, activationCode: null, account: null, downloadLink: null, notes: null };
+    order.fulfillmentStatus = hasManual ? "PROCESSING" : "DELIVERED";
+  } else {
+    order.fulfillmentStatus = "PROCESSING"; // manual queue
+  }
+  if (order.fulfillmentStatus === "DELIVERED") order.deliveredAt = Date.now();
+  order.history.push({ at: Date.now(), state: order.fulfillmentStatus, by: "fulfillment" });
+
+  const customer = db.users.find((u) => u.id === order.customerId);
+  if (customer) {
+    sendEmail(db, customer, order.fulfillmentStatus === "DELIVERED" ? "delivered" : "processing", order.number);
+    notify(db, customer.id, order.fulfillmentStatus === "DELIVERED" ? "n.delivered" : "n.status", { n: order.number }, `/account/orders/${order.id}`);
+  }
+  if (order.fulfillmentStatus === "PROCESSING") {
+    for (const s of db.users.filter((u) => u.role === "OWNER" || u.role === "ADMIN" || u.role === "SUPPORT"))
+      notify(db, s.id, "n.manual", { n: order.number }, `/admin/orders/${order.id}`);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Webhook processing — signature check + event-id idempotency         */
+/* ------------------------------------------------------------------ */
+
+function processPaymentEvent(db: DB, event: { eventId: string; provider: "STRIPE" | "PAYPAL"; type: "payment.captured" | "payment.failed"; orderId: string; signatureValid: boolean }) {
+  if (!event.signatureValid) throw new ApiError("e.gateway");
+  const existing = db.paymentEvents.find((e) => e.eventId === event.eventId);
+  if (existing?.processed) return { duplicate: true }; // duplicate webhook — ignored
+  db.paymentEvents.push({ ...event, processed: true, receivedAt: Date.now() });
+
+  const order = db.orders.find((o) => o.id === event.orderId);
+  if (!order || order.paymentStatus === "PAID" || order.paymentStatus === "REFUNDED") return { duplicate: true };
+  const payment = db.payments.find((p) => p.orderId === order.id);
+
+  if (event.type === "payment.captured") {
+    if (payment) { payment.status = "PAID"; payment.capturedAt = Date.now(); payment.providerRef = `pi_${randomToken(8)}`; }
+    order.paymentId = payment?.providerRef ?? null;
+    order.paymentStatus = "PAID";
+    order.paidAt = Date.now();
+    order.history.push({ at: Date.now(), state: "PAID", by: `webhook:${event.provider.toLowerCase()}` });
+    if (order.couponCode) {
+      const c = db.coupons.find((x) => x.code === order.couponCode);
+      if (c) c.uses += 1;
+    }
+    for (const it of order.items) if (it.deliveryMethod === "MANUAL") { const p = db.products.find((x) => x.id === it.productId); if (p) p.stock = Math.max(0, p.stock - it.qty); }
+    notify(db, order.customerId, "n.paid", { n: order.number }, `/account/orders/${order.id}`);
+    fulfill(db, order);
+  } else {
+    if (payment) { payment.status = "FAILED"; }
+    order.paymentStatus = "FAILED";
+    order.fulfillmentStatus = "CANCELLED";
+    order.history.push({ at: Date.now(), state: "FAILED", by: `webhook:${event.provider.toLowerCase()}` });
+    releaseReserved(db, order.id);
+    const customer = db.users.find((u) => u.id === order.customerId);
+    if (customer) sendEmail(db, customer, "payment_failed", order.number);
+  }
+  return { duplicate: false };
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API                                                          */
+/* ------------------------------------------------------------------ */
+
+export const api = {
+  /* ---------- auth ---------- */
+  async register(name: string, email: string, password: string) {
+    const db = store.db;
+    email = email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new ApiError("au.badEmail");
+    if (password.length < 8) throw new ApiError("au.short");
+    if (db.users.some((u) => u.email === email)) throw new ApiError("au.taken");
+    const salt = makeSalt();
+    const user: User = {
+      id: uid("u"), name: name.trim() || email.split("@")[0], email, salt,
+      passwordHash: await hashPassword(password, salt), role: "CUSTOMER",
+      lang: store.ui.lang, currency: store.ui.currency, verified: false,
+      verifyToken: randomToken(), verifyExpires: Date.now() + DAY,
+      resetToken: null, resetExpires: null, createdAt: Date.now(), failedLogins: 0, lockedUntil: null,
+    };
+    store.mutate((d) => {
+      d.users.push(user);
+      d.sessionUserId = user.id; d.sessionToken = randomToken(); d.sessionExpires = Date.now() + 7 * DAY;
+      sendEmail(d, user, "welcome");
+      sendEmail(d, user, "verify");
+      notify(d, user.id, "n.welcome", undefined, "/account");
+    });
+    return user;
+  },
+
+  async login(email: string, password: string) {
+    const db = store.db;
+    const user = db.users.find((u) => u.email === email.trim().toLowerCase());
+    if (!user) throw new ApiError("au.wrong");
+    if (user.lockedUntil && user.lockedUntil > Date.now()) throw new ApiError("au.locked");
+    const ok = await verifyPassword(password, user.salt, user.passwordHash);
+    if (!ok) {
+      store.mutate((d) => {
+        const u = d.users.find((x) => x.id === user.id)!;
+        u.failedLogins += 1;
+        if (u.failedLogins >= 5) { u.lockedUntil = Date.now() + 5 * 60000; u.failedLogins = 0; }
+      });
+      throw new ApiError("au.wrong");
+    }
+    store.mutate((d) => {
+      const u = d.users.find((x) => x.id === user.id)!;
+      u.failedLogins = 0; u.lockedUntil = null;
+      d.sessionUserId = u.id; d.sessionToken = randomToken(); d.sessionExpires = Date.now() + 7 * DAY;
+    });
+    return user;
+  },
+
+  logout() { store.mutate((d) => { d.sessionUserId = null; d.sessionToken = null; d.sessionExpires = null; }); },
+
+  async requestReset(email: string) {
+    const user = store.db.users.find((u) => u.email === email.trim().toLowerCase());
+    if (user)
+      store.mutate((d) => {
+        const u = d.users.find((x) => x.id === user.id)!;
+        u.resetToken = randomToken(); u.resetExpires = Date.now() + 30 * 60000;
+        sendEmail(d, u, "reset");
+      });
+    // identical response whether or not the account exists — no enumeration
+  },
+
+  async resetPassword(token: string, password: string) {
+    if (password.length < 8) throw new ApiError("au.short");
+    const user = store.db.users.find((u) => u.resetToken === token);
+    if (!user || !user.resetExpires || user.resetExpires < Date.now()) throw new ApiError("e.notFound");
+    const salt = makeSalt();
+    const hash = await hashPassword(password, salt);
+    store.mutate((d) => {
+      const u = d.users.find((x) => x.id === user.id)!;
+      u.salt = salt; u.passwordHash = hash; u.resetToken = null; u.resetExpires = null;
+    });
+  },
+
+  verifyEmail(token: string) {
+    const user = store.db.users.find((u) => u.verifyToken === token);
+    if (!user || !user.verifyExpires || user.verifyExpires < Date.now()) throw new ApiError("e.notFound");
+    store.mutate((d) => {
+      const u = d.users.find((x) => x.id === user.id)!;
+      u.verified = true; u.verifyToken = null; u.verifyExpires = null;
+    });
+  },
+
+  resendVerification() {
+    const u = requireAuth();
+    store.mutate((d) => {
+      const user = d.users.find((x) => x.id === u.id)!;
+      user.verifyToken = randomToken(); user.verifyExpires = Date.now() + DAY;
+      sendEmail(d, user, "verify");
+    });
+  },
+
+  updateProfile(patch: { name?: string }) {
+    const u = requireAuth();
+    store.mutate((d) => { d.users.find((x) => x.id === u.id)!.name = patch.name?.trim() || u.name; });
+  },
+
+  async changePassword(current: string, next: string) {
+    const u = requireAuth();
+    if (!(await verifyPassword(current, u.salt, u.passwordHash))) throw new ApiError("au.wrong");
+    if (next.length < 8) throw new ApiError("au.short");
+    const salt = makeSalt();
+    const hash = await hashPassword(next, salt);
+    store.mutate((d) => { const x = d.users.find((y) => y.id === u.id)!; x.salt = salt; x.passwordHash = hash; });
+  },
+
+  /* ---------- cart & wishlist ---------- */
+  addToCart(productId: string, qty = 1) {
+    const p = store.db.products.find((x) => x.id === productId);
+    if (!p || !p.active) throw new ApiError("e.notFound");
+    const stock = availableStock(store.db, p);
+    if (stock < 1) throw new ApiError("e.outOfStock");
+    store.mutate((d) => {
+      const line = d.cart.find((c) => c.productId === productId);
+      const next = Math.min((line?.qty ?? 0) + qty, stock, 5);
+      if (line) line.qty = next; else d.cart.push({ productId, qty: Math.min(qty, stock, 5) });
+    });
+  },
+  setCartQty(productId: string, qty: number) {
+    const p = store.db.products.find((x) => x.id === productId);
+    const stock = p ? availableStock(store.db, p) : 0;
+    store.mutate((d) => {
+      const line = d.cart.find((c) => c.productId === productId);
+      if (!line) return;
+      line.qty = Math.max(1, Math.min(qty, stock, 5));
+    });
+  },
+  removeFromCart(productId: string) { store.mutate((d) => { d.cart = d.cart.filter((c) => c.productId !== productId); }); },
+  clearCart() { store.mutate((d) => { d.cart = []; }); },
+
+  toggleWishlist(productId: string) {
+    const u = requireAuth();
+    store.mutate((d) => {
+      const i = d.wishlist.findIndex((w) => w.userId === u.id && w.productId === productId);
+      if (i >= 0) d.wishlist.splice(i, 1); else d.wishlist.push({ userId: u.id, productId });
+    });
+  },
+
+  /* ---------- checkout ---------- */
+  placeOrder(couponCode: string | null, paymentMethod: "STRIPE" | "PAYPAL"): Order {
+    const u = requireAuth();
+    const db = store.db;
+    if (!u.verified) throw new ApiError("co.verify");
+    if (db.settings.maintenanceMode) throw new ApiError("e.maintenance");
+    if (db.cart.length === 0) throw new ApiError("e.notFound");
+    for (const it of db.cart) {
+      const p = db.products.find((x) => x.id === it.productId);
+      if (!p || !p.active || availableStock(db, p) < it.qty) throw new ApiError("e.outOfStock");
+    }
+    const totals = computeTotals(db.cart, couponCode, u.currency);
+    if (couponCode && totals.couponError) throw new ApiError(totals.couponError);
+
+    const order: Order = {
+      id: uid("o"), number: `SK-${new Date().getFullYear()}-${String(db.orderSeq).padStart(4, "0")}`,
+      customerId: u.id, customerName: u.name, email: u.email,
+      items: totals.lines.map((l) => ({ productId: l.product.id, name: l.product.name.en, image: l.product.image, qty: l.qty, unitUsd: l.unitUsd, lineTotalUsd: l.lineUsd, deliveryMethod: l.product.deliveryMethod })),
+      couponCode: totals.coupon?.code ?? null, discountUsd: totals.discountUsd, taxUsd: totals.taxUsd,
+      totalUsd: totals.totalUsd, currency: totals.currency, fxRate: totals.fxRate, totalMinor: totals.totalMinor,
+      paymentMethod, paymentId: null, paymentStatus: "PENDING", fulfillmentStatus: "PENDING",
+      delivery: null, deliveredBy: null,
+      history: [{ at: Date.now(), state: "PENDING_PAYMENT", by: "customer" }],
+      createdAt: Date.now(), paidAt: null, deliveredAt: null,
+    };
+    store.mutate((d) => {
+      d.orderSeq += 1;
+      d.orders.unshift(order);
+      d.payments.push({ id: uid("pay"), orderId: order.id, provider: paymentMethod, providerRef: null, amountUsd: order.totalUsd, currency: order.currency, amountMinor: order.totalMinor, status: "PENDING", createdAt: Date.now(), capturedAt: null });
+      // transactional reservation — keys can never be double-sold
+      for (const it of order.items) if (it.deliveryMethod === "AUTO") reserveKeys(d, it.productId, it.qty, order.id);
+      d.cart = [];
+      notify(d, u.id, "n.order", { n: order.number }, `/account/orders/${order.id}`);
+    });
+    return order;
+  },
+
+  /** Simulates the provider round-trip, then processes a signed webhook event.
+   *  The browser result is irrelevant — only this verified event changes state. */
+  async confirmPayment(orderId: string, cardNumber?: string): Promise<{ duplicate: boolean }> {
+    const u = requireAuth();
+    const db = store.db;
+    const order = db.orders.find((o) => o.id === orderId);
+    if (!order || order.customerId !== u.id) throw new ApiError("e.notFound");
+    const method = order.paymentMethod.toLowerCase() as "stripe" | "paypal";
+    if (!db.settings[`${method}Enabled` as "stripeEnabled" | "paypalEnabled"]) throw new ApiError("e.gateway");
+    await new Promise((r) => setTimeout(r, 900 + Math.random() * 600));
+    const declined = !!cardNumber && cardNumber.replace(/\s/g, "").endsWith("0002");
+    const attempt = db.paymentEvents.filter((e) => e.orderId === orderId).length;
+    const result = processPaymentEvent(db, {
+      eventId: `evt_${orderId}_${attempt}`, provider: order.paymentMethod,
+      type: declined ? "payment.failed" : "payment.captured", orderId, signatureValid: true,
+    });
+    store.persist(); store.emit();
+    if (declined) throw new ApiError("e.declined");
+    return result;
+  },
+
+  /* ---------- customer actions ---------- */
+  addReview(productId: string, rating: number, text: string) {
+    const u = requireAuth();
+    const db = store.db;
+    if (db.reviews.some((r) => r.productId === productId && r.customerId === u.id)) throw new ApiError("e.already");
+    const purchased = db.orders.some((o) => o.customerId === u.id && o.paymentStatus !== "FAILED" && o.items.some((i) => i.productId === productId));
+    store.mutate((d) => {
+      d.reviews.unshift({
+        id: uid("rv"), productId, customerId: u.id, customerName: u.name,
+        rating: Math.min(5, Math.max(1, rating)), text: text.trim(), verified: purchased,
+        approved: !d.settings.requireReviewApproval, reported: false, createdAt: Date.now(),
+      });
+    });
+  },
+
+  createTicket(subject: string, orderId: string | null, message: string) {
+    const u = requireAuth();
+    const id = uid("tk");
+    store.mutate((d) => {
+      d.tickets.unshift({ id, customerId: u.id, orderId, subject: subject.trim(), status: "OPEN", assignee: null, createdAt: Date.now(), updatedAt: Date.now() });
+      d.ticketMessages.push({ id: uid("tm"), ticketId: id, authorId: u.id, authorName: u.name, staff: false, text: message.trim(), createdAt: Date.now() });
+      for (const s of d.users.filter((x) => x.role !== "CUSTOMER")) notify(d, s.id, "n.reply", undefined, `/admin/tickets`);
+    });
+    return id;
+  },
+
+  replyTicket(ticketId: string, text: string) {
+    const u = requireAuth();
+    store.mutate((d) => {
+      const t = d.tickets.find((x) => x.id === ticketId);
+      if (!t) return;
+      const isStaffUser = u.role !== "CUSTOMER" && (t.customerId !== u.id);
+      if (t.customerId !== u.id && !isStaffUser) throw new ApiError("e.forbidden");
+      d.ticketMessages.push({ id: uid("tm"), ticketId, authorId: u.id, authorName: u.name, staff: isStaffUser, text: text.trim(), createdAt: Date.now() });
+      t.updatedAt = Date.now();
+      if (isStaffUser) {
+        t.status = "PENDING";
+        notify(d, t.customerId, "n.reply", undefined, `/support/${t.id}`);
+      } else t.status = "OPEN";
+    });
+  },
+
+  closeTicket(ticketId: string) {
+    const u = requireAuth();
+    store.mutate((d) => {
+      const t = d.tickets.find((x) => x.id === ticketId);
+      if (!t) return;
+      if (t.customerId !== u.id && u.role === "CUSTOMER") throw new ApiError("e.forbidden");
+      t.status = "CLOSED"; t.updatedAt = Date.now();
+    });
+  },
+
+  markAllRead() {
+    const u = requireAuth();
+    store.mutate((d) => { d.notifications.forEach((n) => { if (n.userId === u.id) n.read = true; }); });
+  },
+  markRead(id: string) { store.mutate((d) => { const n = d.notifications.find((x) => x.id === id); if (n) n.read = true; }); },
+
+  /* ---------- admin: orders ---------- */
+  deliverManual(orderId: string, payload: DeliveryPayload) {
+    const actor = requirePerm("deliver");
+    store.mutate((d) => {
+      const o = d.orders.find((x) => x.id === orderId);
+      if (!o) throw new ApiError("e.notFound");
+      if (o.paymentStatus !== "PAID") throw new ApiError("e.notPaid"); // never deliver unpaid orders
+      o.delivery = { ...payload, keys: [...(o.delivery?.keys ?? []), ...payload.keys] }; // merge with auto-delivered keys
+      o.fulfillmentStatus = "DELIVERED";
+      o.deliveredAt = Date.now();
+      o.deliveredBy = actor.id;
+      o.history.push({ at: Date.now(), state: "DELIVERED", by: `manual:${actor.name}` });
+      const customer = d.users.find((x) => x.id === o.customerId);
+      if (customer) { sendEmail(d, customer, "delivered", o.number); notify(d, customer.id, "n.delivered", { n: o.number }, `/account/orders/${o.id}`); }
+      audit(d, actor, "MANUAL_DELIVERED", o.number, payload.keys.length ? `${payload.keys.length} key(s)` : payload.account ? "account credentials" : "delivery data");
+    });
+  },
+
+  completeOrder(orderId: string) {
+    const actor = requirePerm("orders");
+    store.mutate((d) => {
+      const o = d.orders.find((x) => x.id === orderId);
+      if (!o || o.fulfillmentStatus !== "DELIVERED") throw new ApiError("e.forbidden");
+      o.fulfillmentStatus = "COMPLETED";
+      o.history.push({ at: Date.now(), state: "COMPLETED", by: staff(actor) });
+      for (const k of d.licenseKeys) if (k.orderId === o.id && k.status === "DELIVERED") k.status = "USED";
+      audit(d, actor, "ORDER_COMPLETED", o.number, "");
+    });
+  },
+
+  refundOrder(orderId: string, reason: string) {
+    const actor = requirePerm("refund");
+    store.mutate((d) => {
+      const o = d.orders.find((x) => x.id === orderId);
+      if (!o || o.paymentStatus !== "PAID") throw new ApiError("e.notPaid");
+      const payment = d.payments.find((p) => p.orderId === o.id);
+      if (payment) payment.status = "REFUNDED";
+      d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", amountUsd: o.totalUsd, reason, issuedBy: actor.id, createdAt: Date.now() });
+      o.paymentStatus = "REFUNDED"; o.fulfillmentStatus = "CANCELLED";
+      o.history.push({ at: Date.now(), state: "REFUNDED", by: staff(actor) });
+      for (const k of d.licenseKeys)
+        if (k.orderId === o.id) { if (k.status === "DELIVERED" || k.status === "USED") k.status = "REVOKED"; else if (k.status === "RESERVED") { k.status = "UNUSED"; k.orderId = null; } }
+      const customer = d.users.find((x) => x.id === o.customerId);
+      if (customer) { sendEmail(d, customer, "refund", o.number); notify(d, customer.id, "n.refund", { n: o.number }, `/account/orders/${o.id}`); }
+      audit(d, actor, "REFUND_ISSUED", o.number, `$${(o.totalUsd / 100).toFixed(2)} — ${reason}`);
+    });
+  },
+
+  cancelOrder(orderId: string) {
+    const actor = requirePerm("cancel");
+    store.mutate((d) => {
+      const o = d.orders.find((x) => x.id === orderId);
+      if (!o || o.paymentStatus === "REFUNDED") throw new ApiError("e.forbidden");
+      releaseReserved(d, o.id);
+      if (o.paymentStatus === "PAID") {
+        const payment = d.payments.find((p) => p.orderId === o.id);
+        if (payment) payment.status = "REFUNDED";
+        d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", amountUsd: o.totalUsd, reason: "Cancelled by staff", issuedBy: actor.id, createdAt: Date.now() });
+        o.paymentStatus = "REFUNDED";
+      } else o.paymentStatus = "FAILED";
+      o.fulfillmentStatus = "CANCELLED";
+      o.history.push({ at: Date.now(), state: "CANCELLED", by: staff(actor) });
+      const customer = d.users.find((x) => x.id === o.customerId);
+      if (customer) { sendEmail(d, customer, "cancelled", o.number); notify(d, customer.id, "n.status", { n: o.number }, `/account/orders/${o.id}`); }
+      audit(d, actor, "ORDER_CANCELLED", o.number, "");
+    });
+  },
+
+  resendReceipt(orderId: string) {
+    const actor = requirePerm("orders");
+    store.mutate((d) => {
+      const o = d.orders.find((x) => x.id === orderId);
+      if (!o) return;
+      const customer = d.users.find((x) => x.id === o.customerId);
+      if (customer) sendEmail(d, customer, o.fulfillmentStatus === "DELIVERED" || o.fulfillmentStatus === "COMPLETED" ? "delivered" : "order_receipt", o.number);
+      audit(d, actor, "EMAIL_RESENT", o.number, "");
+    });
+  },
+
+  /* ---------- admin: keys ---------- */
+  importKeys(productId: string, raw: string): number {
+    const actor = requirePerm("keys");
+    const db = store.db;
+    const existing = new Set(db.licenseKeys.map((k) => k.key));
+    const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length >= 5 && !existing.has(s));
+    store.mutate((d) => {
+      for (const key of lines) { existing.add(key); d.licenseKeys.push({ id: uid("k"), productId, key, status: "UNUSED", orderId: null, reservedAt: null, deliveredAt: null, customerId: null }); }
+      audit(d, actor, "KEYS_IMPORTED", db.products.find((p) => p.id === productId)?.slug ?? productId, `${lines.length} keys`);
+    });
+    return lines.length;
+  },
+
+  revokeKey(keyId: string) {
+    const actor = requirePerm("keys");
+    store.mutate((d) => {
+      const k = d.licenseKeys.find((x) => x.id === keyId);
+      if (!k || k.status === "DELIVERED" || k.status === "USED") throw new ApiError("e.forbidden");
+      k.status = "REVOKED";
+      audit(d, actor, "KEY_REVOKED", k.key.slice(0, 9) + "…", "");
+    });
+  },
+
+  /* ---------- admin: products ---------- */
+  saveProduct(p: Product, isNew: boolean) {
+    const actor = requirePerm("products");
+    store.mutate((d) => {
+      if (isNew) { d.products.unshift({ ...p, createdAt: Date.now() }); audit(d, actor, "PRODUCT_CREATED", p.slug, p.name.en); }
+      else {
+        const old = d.products.find((x) => x.id === p.id);
+        if (old && old.priceUsd !== p.priceUsd) audit(d, actor, "PRICE_CHANGED", p.slug, `$${(old.priceUsd / 100).toFixed(2)} → $${(p.priceUsd / 100).toFixed(2)}`);
+        const i = d.products.findIndex((x) => x.id === p.id);
+        if (i >= 0) d.products[i] = p;
+        audit(d, actor, "PRODUCT_UPDATED", p.slug, "");
+      }
+    });
+  },
+
+  toggleProduct(id: string, flag: "active" | "featured" | "isNew") {
+    const actor = requirePerm("products");
+    store.mutate((d) => {
+      const p = d.products.find((x) => x.id === id);
+      if (!p) return;
+      p[flag] = !p[flag];
+      audit(d, actor, `PRODUCT_${flag.toUpperCase()}_${p[flag] ? "ON" : "OFF"}`, p.slug, "");
+    });
+  },
+
+  /* ---------- admin: coupons ---------- */
+  saveCoupon(c: Coupon, isNew: boolean) {
+    const actor = requirePerm("coupons");
+    store.mutate((d) => {
+      if (isNew) d.coupons.unshift(c);
+      else { const i = d.coupons.findIndex((x) => x.code === c.code); if (i >= 0) d.coupons[i] = c; }
+      audit(d, actor, isNew ? "COUPON_CREATED" : "COUPON_UPDATED", c.code, `${c.type} ${c.type === "PERCENT" ? c.value + "%" : "$" + c.value / 100}`);
+    });
+  },
+  toggleCoupon(code: string) {
+    const actor = requirePerm("coupons");
+    store.mutate((d) => {
+      const c = d.coupons.find((x) => x.code === code);
+      if (c) { c.active = !c.active; audit(d, actor, c.active ? "COUPON_ACTIVATED" : "COUPON_DEACTIVATED", code, ""); }
+    });
+  },
+  deleteCoupon(code: string) {
+    const actor = requirePerm("coupons");
+    store.mutate((d) => { d.coupons = d.coupons.filter((x) => x.code !== code); audit(d, actor, "COUPON_DELETED", code, ""); });
+  },
+
+  /* ---------- admin: customers ---------- */
+  setRole(userId: string, role: Role) {
+    const actor = requirePerm("roles");
+    if (actor.id === userId) throw new ApiError("e.selfRole");
+    store.mutate((d) => {
+      const u = d.users.find((x) => x.id === userId);
+      if (!u) return;
+      const old = u.role; u.role = role;
+      audit(d, actor, "ROLE_CHANGED", u.email, `${old} → ${role}`);
+    });
+  },
+
+  /* ---------- admin: tickets / reviews / emails ---------- */
+  setTicketStatus(ticketId: string, status: "OPEN" | "PENDING" | "CLOSED") {
+    requirePerm("tickets");
+    store.mutate((d) => { const t = d.tickets.find((x) => x.id === ticketId); if (t) { t.status = status; t.updatedAt = Date.now(); } });
+  },
+  assignTicket(ticketId: string) {
+    const actor = requirePerm("tickets");
+    store.mutate((d) => { const t = d.tickets.find((x) => x.id === ticketId); if (t) { t.assignee = actor.id; if (t.status === "OPEN") t.status = "PENDING"; } });
+  },
+  moderateReview(id: string, approved: boolean) {
+    const actor = requirePerm("products");
+    store.mutate((d) => { const r = d.reviews.find((x) => x.id === id); if (r) { r.approved = approved; audit(d, actor, approved ? "REVIEW_APPROVED" : "REVIEW_REJECTED", r.id.slice(0, 10), ""); } });
+  },
+  deleteReview(id: string) {
+    const actor = requirePerm("products");
+    store.mutate((d) => { d.reviews = d.reviews.filter((x) => x.id !== id); audit(d, actor, "REVIEW_DELETED", id.slice(0, 10), ""); });
+  },
+  retryEmail(id: string) {
+    requirePerm("emails");
+    store.mutate((d) => { const e = d.emailLogs.find((x) => x.id === id); if (e) { e.status = "SENT"; e.createdAt = Date.now(); } });
+  },
+  sendTestEmail() {
+    const actor = requirePerm("emails");
+    store.mutate((d) => { sendEmail(d, { email: actor.email, name: actor.name, lang: actor.lang }, "test"); });
+  },
+
+  updateSettings(patch: Partial<DB["settings"]>) {
+    const actor = requirePerm("settings");
+    store.mutate((d) => {
+      d.settings = { ...d.settings, ...patch };
+      audit(d, actor, "SETTINGS_CHANGED", Object.keys(patch).join(","), "");
+    });
+  },
+};
+
+/* ------------------------------------------------------------------ */
+/* Selectors                                                           */
+/* ------------------------------------------------------------------ */
+
+export function orderStateKey(o: Order): string {
+  if (o.paymentStatus === "FAILED") return "st.FAILED";
+  if (o.paymentStatus === "REFUNDED") return "st.REFUNDED";
+  if (o.paymentStatus === "PENDING") return "st.PENDING_PAYMENT";
+  return `st.${o.fulfillmentStatus}`;
+}
+
+export function stats(db: DB) {
+  const paidLike = (o: Order) => o.paymentStatus === "PAID" || o.paymentStatus === "REFUNDED";
+  const now = Date.now();
+  const revenueUsd = db.orders.filter(paidLike).reduce((s, o) => s + o.totalUsd, 0);
+  const revenue30 = db.orders.filter((o) => paidLike(o) && o.createdAt > now - 30 * DAY).reduce((s, o) => s + o.totalUsd, 0);
+  const days: { label: string; usd: number }[] = [];
+  for (let i = 13; i >= 0; i--) {
+    const start = now - i * DAY;
+    const dayStart = new Date(start); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = dayStart.getTime() + DAY;
+    const usd = db.orders.filter((o) => paidLike(o) && o.createdAt >= dayStart.getTime() && o.createdAt < dayEnd).reduce((s, o) => s + o.totalUsd, 0);
+    days.push({ label: new Date(dayStart).toLocaleDateString("en", { day: "2-digit", month: "2-digit" }), usd });
+  }
+  return {
+    revenueUsd, revenue30, days,
+    orders: db.orders.length,
+    customers: db.users.filter((u) => u.role === "CUSTOMER").length,
+    vaultKeys: db.licenseKeys.filter((k) => k.status === "UNUSED").length,
+    deliveredKeys: db.licenseKeys.filter((k) => k.status === "DELIVERED" || k.status === "USED").length,
+    pendingManual: db.orders.filter((o) => o.paymentStatus === "PAID" && o.fulfillmentStatus === "PROCESSING").length,
+    failedPayments: db.orders.filter((o) => o.paymentStatus === "FAILED").length,
+    lowStock: db.products.filter((p) => p.active && availableStock(db, p) <= p.lowStockThreshold),
+    productsLive: db.products.filter((p) => p.active).length,
+    paymentsToday: db.paymentEvents.filter((e) => e.type === "payment.captured" && e.receivedAt > new Date(new Date().setHours(0, 0, 0, 0)).getTime()).length,
+  };
+}
+
+export function productSales(db: DB, productId: string): number {
+  return db.orders.filter((o) => o.paymentStatus !== "FAILED").reduce((s, o) => s + o.items.filter((i) => i.productId === productId).reduce((x, i) => x + i.qty, 0), 0);
+}
+
+export function productRating(db: DB, productId: string): { avg: number; count: number } {
+  const rs = db.reviews.filter((r) => r.productId === productId && r.approved);
+  if (rs.length === 0) return { avg: 0, count: 0 };
+  return { avg: rs.reduce((s, r) => s + r.rating, 0) / rs.length, count: rs.length };
+}
