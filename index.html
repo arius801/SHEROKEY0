@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="SHEROKEY — premium digital marketplace. License keys, subscriptions and activation codes delivered in seconds. Windows, Office, Adobe, VPN, gift cards and more." />
     <meta name="theme-color" content="#0a0f17" />
-    <!-- A20: browser-enforceable security headers (server-side headers required in production — see DEPLOYMENT) -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' https: data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <!-- Security headers (CSP, HSTS, X-Content-Type-Options, Referrer-Policy) are set by the
+         production server/CDN — see DEPLOYMENT. A meta-CSP here can break host-injected scripts. -->
     <meta name="referrer" content="strict-origin-when-cross-origin" />
     <meta property="og:title" content="SHEROKEY — Digital Keys, Licenses & Subscriptions" />
     <meta property="og:description" content="License keys and subscriptions, verified and delivered in seconds." />
@@ -18,9 +18,34 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;500;600;700;800;900&family=Manrope:wght@400;500;600;700;800&family=Noto+Kufi+Arabic:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <title>SHEROKEY — Digital Keys, Licenses & Subscriptions</title>
+    <!-- Boot watchdog: a startup failure must never render as a black screen. -->
+    <script>
+      (function () {
+        var errors = [];
+        window.addEventListener("error", function (e) { errors.push(e.message || "script error"); });
+        window.addEventListener("unhandledrejection", function (e) { errors.push(String(e.reason && e.reason.message || e.reason || "rejection")); });
+        window.__skBoot = setTimeout(function () {
+          var r = document.getElementById("root");
+          if (r && !r.childElementCount) {
+            var card = document.createElement("div");
+            card.setAttribute("style", "min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0f17;color:#e9f0f8;font-family:Manrope,system-ui,sans-serif;padding:1rem;");
+            card.innerHTML =
+              '<div style="max-width:26rem;width:100%;border:1px solid #1d2839;background:#0f1622;border-radius:14px;padding:2rem;text-align:center">' +
+              '<div style="font-weight:800;letter-spacing:.02em;font-size:1.05rem">SHERO<span style="color:#2fc98a">KEY</span></div>' +
+              '<p style="color:#93a3b8;font-size:.85rem;line-height:1.6;margin:.9rem 0 1.2rem">' +
+              'The store could not start in this browser. Try a hard refresh (Ctrl/Cmd + Shift + R).<br/>' +
+              '\u062a\u0639\u0630\u0651\u0631 \u062a\u0634\u063a\u064a\u0644 \u0627\u0644\u0645\u062a\u062c\u0631 \u2014 \u062c\u0631\u0651\u0628 \u062a\u062d\u062f\u064a\u062b \u0627\u0644\u0635\u0641\u062d\u0629 (Ctrl/Cmd + Shift + R).' +
+              (errors.length ? '</p><pre style="text-align:left;color:#f0716f;font-size:.7rem;background:#0a0f17;border:1px solid #1d2839;border-radius:8px;padding:.6rem;overflow:auto;max-height:8rem">' + errors.join("\n").replace(/</g, "&lt;") + "</pre>" : "</p>") +
+              "</div>";
+            r.appendChild(card);
+          }
+        }, 7000);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
+    <noscript><div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0f17;color:#e9f0f8;font-family:sans-serif">SHEROKEY requires JavaScript. / يتطلب SHEROKEY تفعيل JavaScript.</div></noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
