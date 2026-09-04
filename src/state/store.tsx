@@ -230,6 +230,12 @@ function audit(db: DB, actor: User, action: string, target: string, meta: string
   if (db.auditLogs.length > 400) db.auditLogs.length = 400;
 }
 
+/** Security events with no human actor (webhooks, system fulfillment) — §28. */
+function auditSystem(db: DB, action: string, target: string, meta: string) {
+  db.auditLogs.unshift({ id: uid("al"), actorId: "system", actorName: "system", action, target, meta, at: Date.now() });
+  if (db.auditLogs.length > 400) db.auditLogs.length = 400;
+}
+
 const MAIL_SUBJECTS: Record<string, string> = {
   welcome: "mail.subject.welcome", verify: "mail.subject.verify", reset: "mail.subject.reset",
   order_receipt: "mail.subject.receipt", delivered: "mail.subject.delivered", payment_failed: "mail.subject.failed",
@@ -451,7 +457,10 @@ function processPaymentEvent(db: DB, event: {
   type: "payment.captured" | "payment.failed"; orderId: string;
   signatureValid: boolean; payloadHash: string | null; providerPaymentId?: string | null;
 }) {
-  if (!event.signatureValid) throw new ApiError("e.gateway"); // unsigned/invalid events never touch state
+  if (!event.signatureValid) {
+    auditSystem(db, "WEBHOOK_REJECTED", event.orderId, `${event.provider} — invalid signature`);
+    throw new ApiError("e.gateway"); // unsigned/invalid events never touch state
+  }
   // idempotency (A9): UNIQUE(provider, providerEventId) — replays return safely, nothing duplicates
   const existing = db.paymentEvents.find((e) => e.provider === event.provider && e.eventId === event.eventId);
   if (existing?.processed) return { duplicate: true }; // duplicate webhook — ignored
@@ -467,6 +476,7 @@ function processPaymentEvent(db: DB, event: {
     order.paymentId = payment?.providerRef ?? null;
     setPaymentStatus(order, "PAID", `webhook:${event.provider.toLowerCase()}`);
     order.paidAt = Date.now();
+    auditSystem(db, "PAYMENT_CONFIRMED", order.number, `${event.provider} · ${event.eventId.slice(0, 18)}`);
     if (order.couponCode) {
       const c = db.coupons.find((x) => x.code === order.couponCode);
       if (c) c.uses += 1;
@@ -477,6 +487,7 @@ function processPaymentEvent(db: DB, event: {
   } else {
     if (payment) { payment.status = "FAILED"; }
     setPaymentStatus(order, "FAILED", `webhook:${event.provider.toLowerCase()}`);
+    auditSystem(db, "PAYMENT_FAILED", order.number, `${event.provider} · ${event.eventId.slice(0, 18)}`);
     setFulfillmentStatus(order, "CANCELLED", `webhook:${event.provider.toLowerCase()}`);
     releaseReserved(db, order.id);
     const customer = db.users.find((u) => u.id === order.customerId);
@@ -512,6 +523,7 @@ export const api = {
       sendEmail(d, user, "welcome");
       sendEmail(d, user, "verify");
       notify(d, user.id, "n.welcome", undefined, "/account");
+      audit(d, user, "REGISTERED", user.email, "verification email sent");
     });
     return user;
   },
@@ -527,7 +539,9 @@ export const api = {
       store.mutate((d) => {
         const u = d.users.find((x) => x.id === user.id)!;
         u.failedLogins += 1;
-        if (u.failedLogins >= 5) { u.lockedUntil = Date.now() + 5 * 60000; u.failedLogins = 0; }
+        const locked = u.failedLogins >= 5;
+        if (locked) { u.lockedUntil = Date.now() + 5 * 60000; u.failedLogins = 0; }
+        audit(d, u, locked ? "LOGIN_LOCKED" : "LOGIN_FAILED", u.email, locked ? "5 failures — 5 min lockout" : "");
       });
       throw new ApiError("au.wrong");
     }
@@ -536,11 +550,18 @@ export const api = {
       u.failedLogins = 0; u.lockedUntil = null;
       d.sessionUserId = u.id; d.sessionToken = randomToken(); d.sessionExpires = Date.now() + 7 * DAY;
       mergeAnonCart(d, u.id);
+      audit(d, u, "LOGIN_SUCCESS", u.email, "session issued");
     });
     return user;
   },
 
-  logout() { store.mutate((d) => { d.sessionUserId = null; d.sessionToken = null; d.sessionExpires = null; }); },
+  logout() {
+    const current = currentUser();
+    store.mutate((d) => {
+      if (current) audit(d, current, "LOGOUT", current.email, "session invalidated");
+      d.sessionUserId = null; d.sessionToken = null; d.sessionExpires = null;
+    });
+  },
 
   async requestReset(email: string) {
     rateLimit("reset", 3, 10 * 60000); // A21
@@ -549,6 +570,7 @@ export const api = {
       store.mutate((d) => {
         const u = d.users.find((x) => x.id === user.id)!;
         u.resetToken = randomToken(); u.resetExpires = Date.now() + 30 * 60000;
+        audit(d, u, "RESET_REQUESTED", u.email, "token expires in 30 min");
         sendEmail(d, u, "reset");
       });
     // identical response whether or not the account exists — no enumeration
@@ -561,6 +583,7 @@ export const api = {
     const salt = makeSalt();
     const hash = await hashPassword(password, salt);
     store.mutate((d) => {
+      audit(d, user, "RESET_COMPLETED", user.email, "password rotated, token consumed");
       const u = d.users.find((x) => x.id === user.id)!;
       u.salt = salt; u.passwordHash = hash; u.resetToken = null; u.resetExpires = null;
     });
@@ -572,6 +595,7 @@ export const api = {
     store.mutate((d) => {
       const u = d.users.find((x) => x.id === user.id)!;
       u.verified = true; u.verifyToken = null; u.verifyExpires = null;
+      audit(d, u, "EMAIL_VERIFIED", u.email, "link token consumed");
     });
   },
 
@@ -596,6 +620,7 @@ export const api = {
     store.mutate((d) => {
       const user = d.users.find((x) => x.id === u.id)!;
       sendEmail(d, user, "otp", undefined, code); // delivery is SANDBOX-simulated; code is hashed in state
+      audit(d, user, "OTP_ISSUED", user.email, "hashed, 5 min TTL, previous invalidated");
     });
   },
 
@@ -610,12 +635,14 @@ export const api = {
     const ok = timingSafeEqual(await sha256Hex(`${rec.salt}::${code.trim()}`), rec.hash);
     if (!ok) {
       rec.attempts += 1;
+      store.mutate((d) => { audit(d, u, "OTP_FAILED", u.email, `attempt ${rec.attempts}/${OTP_MAX_ATTEMPTS}`); });
       throw new ApiError(rec.attempts >= OTP_MAX_ATTEMPTS ? "e.otpLocked" : "e.otpWrong");
     }
     otpRecords.delete(u.email); // one-time use
     store.mutate((d) => {
       const user = d.users.find((x) => x.id === u.id)!;
       user.verified = true; user.verifyToken = null; user.verifyExpires = null;
+      audit(d, user, "OTP_VERIFIED", user.email, "email ownership confirmed — not payment proof");
     });
   },
 
@@ -709,6 +736,7 @@ export const api = {
     store.mutate((d) => {
       d.orderSeq += 1;
       d.orders.unshift(order);
+      audit(d, u, "PAYMENT_CREATED", order.number, `${provId} · ${order.currency} · server-priced ${order.totalMinor}`);
       d.payments.push({
         id: uid("pay"), orderId: order.id, provider: provId, providerRef: null,
         providerCustomerId: null, paymentMethod: pm,

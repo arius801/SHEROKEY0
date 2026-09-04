@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+
+# Production note: a real sitemap.xml must be generated server-side (SSR)
+# with canonical URLs. It is intentionally absent in this static build
+# because hash-routed URLs are not indexable paths.

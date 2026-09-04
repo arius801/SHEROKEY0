@@ -62,7 +62,7 @@ export function Login() {
   return (
     <AuthShell title={t("au.welcome")} sub={t("nav.home") + " → SHEROKEY"}>
       <form onSubmit={submit} className="space-y-4">
-        <Field label={t("au.email")}><Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="demo@sherokey.com" dir="ltr" autoComplete="email" /></Field>
+        <Field label={t("au.email")}><Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" dir="ltr" autoComplete="email" /></Field>
         <Field label={t("au.pass")}><PassInput value={pass} onChange={setPass} /></Field>
         {err && <p className="text-[12.5px] font-bold text-danger-400 flex items-center gap-2"><IAlert size={14} /> {err}</p>}
         <Btn type="submit" size="lg" className="w-full" loading={busy}>{t("au.login")}</Btn>
@@ -71,15 +71,8 @@ export function Login() {
         <Link to="/auth/forgot" className="text-dim hover:text-volt-400 transition">{t("au.forgot")}</Link>
         <Link to="/auth/register" className="text-volt-400 hover:underline">{t("au.register")}</Link>
       </div>
-      <div className="mt-7 rounded-xl border border-line bg-canvas p-4">
-        <p className="text-[11px] font-extrabold uppercase tracking-widest text-faint mb-2.5">{t("au.demo")}</p>
-        <div className="grid sm:grid-cols-2 gap-1.5 text-[11.5px] font-mono text-dim" dir="ltr">
-          <span>owner@sherokey.com / Owner@2024</span>
-          <span>admin@sherokey.com / Admin@2024</span>
-          <span>support@sherokey.com / Support@2024</span>
-          <span>demo@sherokey.com / Demo@2024</span>
-        </div>
-      </div>
+      {/* §36: credentials never surface in the product UI.
+          Sandbox/dev seed accounts are documented in DEPLOYMENT.md (dev-only). */}
     </AuthShell>
   );
 }
@@ -119,10 +112,13 @@ export function Register() {
 
 /** After registration — shows the real verification link (dev shortcut for the emailed token). */
 export function VerifySent() {
-  const { t, user } = useApp();
+  const { t, user, db } = useApp();
   const nav = useNavigate();
   if (!user) return <AuthShell title={t("au.verifyTitle")} sub="">{null}</AuthShell>;
-  const link = user.verifyToken ? `#/verify?t=${user.verifyToken}` : null;
+  // §36: the clickable token shortcut exists ONLY in explicitly TEST-mode workspaces;
+  // production delivers the token exclusively inside the verification email.
+  const sandbox = db.settings.providers?.STRIPE?.mode === "TEST";
+  const link = user.verifyToken && sandbox ? `#/verify?t=${user.verifyToken}` : null;
   return (
     <AuthShell title={t("au.verifyTitle")} sub={t("au.verifyDesc", { email: user.email })}>
       <div className="sk-card !bg-canvas p-5 text-center space-y-4">
@@ -146,7 +142,7 @@ export function VerifySent() {
 }
 
 export function Verify() {
-  const { t } = useApp();
+  const { t, user } = useApp();
   const [params] = useSearchParams();
   const nav = useNavigate();
   const [state, setState] = useState<"ok" | "err" | null>(null);
@@ -158,9 +154,16 @@ export function Verify() {
     <AuthShell title={t("au.verifyTitle")} sub="">
       <div className="text-center py-6 space-y-5">
         {state === "ok" && <><span className="inline-flex w-14 h-14 rounded-2xl bg-volt-500/12 border border-volt-500/30 text-volt-400 items-center justify-center anim-pop"><ICheck size={24} /></span><p className="font-display font-bold">{t("au.verifiedOk")}</p></>}
-        {state === "err" && <><span className="inline-flex w-14 h-14 rounded-2xl bg-danger-500/12 border border-danger-500/30 text-danger-400 items-center justify-center"><IAlert size={24} /></span><p className="font-display font-bold">{t("e.notFound")}</p></>}
+        {state === "err" && <>
+          <span className="inline-flex w-14 h-14 rounded-2xl bg-danger-500/12 border border-danger-500/30 text-danger-400 items-center justify-center"><IAlert size={24} /></span>
+          <p className="font-display font-bold">{t("e.notFound")}</p>
+          {/* §5: expired/invalid link recovery — resend without revealing account state */}
+          {user && !user.verified && (
+            <Btn variant="soft" onClick={() => { api.resendVerification(); toast(t("au.sent"), "info"); }}>{t("au.resend")}</Btn>
+          )}
+        </>}
         {state === null && <p className="text-dim text-sm">{t("c.loading")}</p>}
-        <Btn onClick={() => nav("/catalog")}>{t("h.cta1")}</Btn>
+        {state === "ok" && <Btn onClick={() => nav("/catalog")}>{t("h.cta1")}</Btn>}
       </div>
     </AuthShell>
   );
@@ -191,7 +194,7 @@ export function Forgot() {
       ) : (
         <div className="space-y-4">
           <p className="text-[13px] text-dim font-semibold flex items-center gap-2"><ICheck size={15} className="text-volt-500" /> {t("au.resetOk")}</p>
-          {target?.resetToken && (
+          {target?.resetToken && db.settings.providers?.STRIPE?.mode === "TEST" && (
             <div className="sk-card !bg-canvas p-4 text-center space-y-3">
               <p className="text-[11.5px] text-faint font-semibold">dev shortcut · {t("hdr.mailbox")}</p>
               <a href={`#/auth/reset?t=${target.resetToken}`} className="inline-flex items-center gap-2 bg-volt-500 text-[#062b1b] font-bold text-sm rounded-[10px] px-5 h-11 hover:bg-volt-400 transition">{t("au.reset")}</a>

@@ -660,6 +660,35 @@ export function AdminPayments() {
         {!isOwner && <p className="mt-2 text-[12px] font-bold text-ember-400 flex items-center gap-1.5"><IShield size={13} /> {t("ad.payOwnerOnly")}</p>}
       </div>
 
+      {/* §24 live provider activity — computed from payment_events / payments rows */}
+      <div className="grid lg:grid-cols-3 gap-4">
+        {(Object.keys(PROVIDER_META) as ProviderId[]).map((id) => {
+          const events = db.paymentEvents.filter((e) => e.provider === id);
+          const lastWebhook = events[events.length - 1];
+          const paid = db.payments.filter((p) => p.provider === id && (p.status === "PAID" || p.status === "REFUNDED") && p.capturedAt);
+          const lastSuccess = paid[paid.length - 1];
+          const failed = db.payments.filter((p) => p.provider === id && p.status === "FAILED");
+          const lastFailed = failed[failed.length - 1];
+          const Row = ({ dot, label, value }: { dot: string; label: string; value: string }) => (
+            <div className="flex items-center justify-between gap-3 py-1.5">
+              <span className="flex items-center gap-2 text-[11.5px] font-bold text-dim"><span className={`w-1.5 h-1.5 rounded-full ${dot}`} />{label}</span>
+              <span className="text-[11px] font-mono text-faint truncate" dir="ltr">{value}</span>
+            </div>
+          );
+          return (
+            <section key={`act-${id}`} className="sk-card px-5 py-4">
+              <p className="text-[10.5px] font-extrabold uppercase tracking-widest text-faint mb-1.5">{PROVIDER_META[id].label} — activity</p>
+              <Row dot="bg-sky-500" label="Last webhook"
+                value={lastWebhook ? `${lastWebhook.type.replace("payment.", "")} · ${formatDate(lastWebhook.receivedAt, "en")}` : "—"} />
+              <Row dot="bg-volt-500" label="Last success"
+                value={lastSuccess ? `${(lastSuccess.amountMinor / 100).toLocaleString("en", { maximumFractionDigits: 2 })} ${lastSuccess.currency} · ${formatDate(lastSuccess.capturedAt!, "en")}` : "—"} />
+              <Row dot="bg-danger-500" label="Last failed"
+                value={lastFailed ? `${formatDate(lastFailed.updatedAt, "en")}` : "—"} />
+            </section>
+          );
+        })}
+      </div>
+
       <div className="grid lg:grid-cols-3 gap-4">
         {(Object.keys(PROVIDER_META) as ProviderId[]).map((id) => {
           const cfg = providerCfg(s, id);
