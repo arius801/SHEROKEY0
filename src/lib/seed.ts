@@ -3,6 +3,7 @@ import type {
   Product, Review, Settings, Ticket, TicketMessage, User, AuditLog,
 } from "./types";
 import { makeSalt, hashPassword, seededRng, uid } from "./crypto";
+import { DEFAULT_PROVIDERS, DEFAULT_ROUTING } from "./payments";
 
 const l = (en: string, ar: string, ru: string, fr: string): L10n => ({ en, ar, ru, fr });
 
@@ -343,15 +344,17 @@ export async function buildSeed(): Promise<DB> {
       o.delivery = null;
     }
     orders.push(o);
+    const provId = o.paymentMethod === "MIR" ? "MIR_ACQUIRER" as const : o.paymentMethod;
+    const pm = o.paymentMethod === "MIR" ? "CARD_MIR" as const : o.paymentMethod === "PAYPAL" ? "PAYPAL" as const : "CARD_INTL" as const;
     payments.push({
-      id: uid("pay"), orderId: id, provider: o.paymentMethod, providerRef: o.paymentId,
+      id: uid("pay"), orderId: id, provider: provId, providerRef: o.paymentId, providerCustomerId: null, paymentMethod: pm,
       amountUsd: o.totalUsd, currency: o.currency, amountMinor: o.totalMinor,
-      status: o.paymentStatus, createdAt: created, capturedAt: o.paymentStatus === "PAID" || o.paymentStatus === "REFUNDED" ? payAt : null,
+      status: o.paymentStatus, createdAt: created, capturedAt: o.paymentStatus === "PAID" || o.paymentStatus === "REFUNDED" ? payAt : null, updatedAt: payAt,
     });
     if (o.paymentStatus !== "FAILED")
-      paymentEvents.push({ eventId: `evt_${id}`, provider: o.paymentMethod, type: "payment.captured", orderId: id, signatureValid: true, processed: true, receivedAt: payAt });
+      paymentEvents.push({ eventId: `evt_${id}`, provider: provId, type: "payment.captured", orderId: id, signatureValid: true, payloadHash: null, processed: true, receivedAt: payAt });
     else
-      paymentEvents.push({ eventId: `evt_${id}`, provider: o.paymentMethod, type: "payment.failed", orderId: id, signatureValid: true, processed: true, receivedAt: payAt });
+      paymentEvents.push({ eventId: `evt_${id}`, provider: provId, type: "payment.failed", orderId: id, signatureValid: true, payloadHash: null, processed: true, receivedAt: payAt });
     emailLogs.push({
       id: uid("em"), to: customer.email, toName: customer.name, type: o.paymentStatus === "FAILED" ? "payment_failed" : "order_receipt",
       subject: o.paymentStatus === "FAILED" ? `Payment failed for ${number}` : `Receipt for order ${number}`,
@@ -375,12 +378,15 @@ export async function buildSeed(): Promise<DB> {
 
   const refunds: DB["refunds"] = [{
     id: uid("rf"), orderId: refunded.id, paymentId: payments.find((p) => p.orderId === refunded.id)!.id,
+    providerRefundId: `re_${refunded.id.slice(-10)}`, status: "SUCCEEDED",
     amountUsd: refunded.totalUsd, reason: "Key failed activation twice", issuedBy: admin.id, createdAt: refunded.history[refunded.history.length - 1].at,
   }];
 
   /* demo user's own delivered orders */
   const demoOrder1 = mkOrder(productById("p-win11"), demo, 12);
   const demoOrder2 = mkOrder(productById("p-spotify"), demo, 6);
+  /* RUB order settled through the MIR acquirer route */
+  mkOrder(productById("p-office"), c3, 4, { paymentMethod: "MIR" });
 
   /* ---- reviews ---- */
   const reviewSeed: [string, User, number, string, string, string, string][] = [
@@ -439,6 +445,7 @@ export async function buildSeed(): Promise<DB> {
     fx: { USD: 1, EUR: 0.9234, SAR: 3.75, RUB: 96.42 },
     stripeEnabled: true, paypalEnabled: true, taxRatePct: 0, maintenanceMode: false,
     emailProvider: "RESEND", emailFrom: "SHEROKEY <no-reply@sherokey.com>", requireReviewApproval: true,
+    providers: DEFAULT_PROVIDERS, routing: DEFAULT_ROUTING,
   };
 
   return {

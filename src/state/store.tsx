@@ -14,6 +14,11 @@ import { buildSeed } from "../lib/seed";
 import { hashPassword, makeSalt, randomToken, uid, verifyPassword } from "../lib/crypto";
 import { convertFromUsd, formatMoney, percentOff } from "../lib/money";
 import { tr, langDir } from "../lib/i18n";
+import {
+  PROVIDERS, providerCfg, verifyEventSignature, eventPayloadHash,
+  type ProviderId, type ProviderCfg, type PaymentRouting,
+} from "../lib/payments";
+import { otpCode, sha256Hex, timingSafeEqual } from "../lib/crypto";
 
 const STORAGE_KEY = "sherokey.workspace.v1";
 const DAY = 86400000;
@@ -196,7 +201,7 @@ export const isStaff = (u: User | null) => !!u && u.role !== "CUSTOMER";
 export const PERMS = {
   products: ["OWNER", "ADMIN"], keys: ["OWNER", "ADMIN"], coupons: ["OWNER", "ADMIN"],
   customers: ["OWNER", "ADMIN"], emails: ["OWNER", "ADMIN"], audit: ["OWNER", "ADMIN"],
-  settings: ["OWNER", "ADMIN"], roles: ["OWNER"],
+  settings: ["OWNER", "ADMIN"], roles: ["OWNER"], payments: ["OWNER"],
   refund: ["OWNER", "ADMIN"], cancel: ["OWNER", "ADMIN"],
   deliver: ["OWNER", "ADMIN", "SUPPORT"], tickets: ["OWNER", "ADMIN", "SUPPORT"],
   orders: ["OWNER", "ADMIN", "SUPPORT"],
@@ -229,16 +234,25 @@ const MAIL_SUBJECTS: Record<string, string> = {
   welcome: "mail.subject.welcome", verify: "mail.subject.verify", reset: "mail.subject.reset",
   order_receipt: "mail.subject.receipt", delivered: "mail.subject.delivered", payment_failed: "mail.subject.failed",
   refund: "mail.subject.refund", cancelled: "mail.subject.cancelled", processing: "mail.subject.processing",
-  test: "mail.subject.welcome",
+  otp: "mail.subject.otp", test: "mail.subject.welcome",
 };
 
-function sendEmail(db: DB, to: { email: string; name: string; lang: Lang }, type: string, orderNumber?: string) {
+function sendEmail(db: DB, to: { email: string; name: string; lang: Lang }, type: string, orderNumber?: string, sandboxCode?: string) {
   db.emailLogs.unshift({
     id: uid("em"), to: to.email, toName: to.name, type,
     subject: tr(to.lang, MAIL_SUBJECTS[type] ?? "mail.subject.receipt", { n: orderNumber ?? "" }),
     lang: to.lang, status: "SENT", provider: db.settings.emailProvider.toLowerCase(), createdAt: Date.now(),
+    sandboxCode: sandboxCode ?? null, // SANDBOX ONLY — never present in a real provider log
   });
 }
+
+/* ---------- one-time email verification codes (req. 1) ----------
+ * Codes are crypto-random, live 5 minutes, are single-use, rate-limited, and only their
+ * salted SHA-256 hash is kept. The plaintext code exists solely inside the outgoing email. */
+interface OtpRecord { hash: string; salt: string; expires: number; attempts: number; }
+const otpRecords = new Map<string, OtpRecord>();
+const OTP_TTL = 5 * 60000;
+const OTP_MAX_ATTEMPTS = 5;
 
 function notify(db: DB, userId: string, type: string, vars?: Record<string, string>, link?: string) {
   db.notifications.unshift({ id: uid("nt"), userId, type, vars, link: link ?? null, read: false, createdAt: Date.now() });
@@ -432,19 +446,24 @@ function fulfill(db: DB, order: Order) {
 /* Webhook processing — signature check + event-id idempotency         */
 /* ------------------------------------------------------------------ */
 
-function processPaymentEvent(db: DB, event: { eventId: string; provider: "STRIPE" | "PAYPAL"; type: "payment.captured" | "payment.failed"; orderId: string; signatureValid: boolean }) {
-  if (!event.signatureValid) throw new ApiError("e.gateway");
-  // idempotency (A9): UNIQUE(provider, event_id) — replays return safely, nothing duplicates
+function processPaymentEvent(db: DB, event: {
+  eventId: string; provider: "STRIPE" | "PAYPAL" | "MIR_ACQUIRER";
+  type: "payment.captured" | "payment.failed"; orderId: string;
+  signatureValid: boolean; payloadHash: string | null; providerPaymentId?: string | null;
+}) {
+  if (!event.signatureValid) throw new ApiError("e.gateway"); // unsigned/invalid events never touch state
+  // idempotency (A9): UNIQUE(provider, providerEventId) — replays return safely, nothing duplicates
   const existing = db.paymentEvents.find((e) => e.provider === event.provider && e.eventId === event.eventId);
   if (existing?.processed) return { duplicate: true }; // duplicate webhook — ignored
-  db.paymentEvents.push({ ...event, processed: true, receivedAt: Date.now() });
+  const { providerPaymentId: _ppid, ...stored } = event;
+  db.paymentEvents.push({ ...stored, processed: true, receivedAt: Date.now() });
 
   const order = db.orders.find((o) => o.id === event.orderId);
   if (!order || order.paymentStatus === "PAID" || order.paymentStatus === "REFUNDED") return { duplicate: true };
   const payment = db.payments.find((p) => p.orderId === order.id);
 
   if (event.type === "payment.captured") {
-    if (payment) { payment.status = "PAID"; payment.capturedAt = Date.now(); payment.providerRef = `pi_${randomToken(8)}`; }
+    if (payment) { payment.status = "PAID"; payment.capturedAt = Date.now(); payment.providerRef = event.providerPaymentId ?? payment.providerRef; payment.updatedAt = Date.now(); }
     order.paymentId = payment?.providerRef ?? null;
     setPaymentStatus(order, "PAID", `webhook:${event.provider.toLowerCase()}`);
     order.paidAt = Date.now();
@@ -566,6 +585,40 @@ export const api = {
     });
   },
 
+  /** Step 1 of pre-payment email verification: issue a one-time code to the account email.
+   *  Invalidates any previous code; the code itself never touches client state or URLs. */
+  async requestPaymentOtp() {
+    const u = requireAuth();
+    rateLimit(`otp-req:${u.id}`, 3, 10 * 60000);
+    const code = otpCode();
+    const salt = randomToken(8);
+    otpRecords.set(u.email, { hash: await sha256Hex(`${salt}::${code}`), salt, expires: Date.now() + OTP_TTL, attempts: 0 });
+    store.mutate((d) => {
+      const user = d.users.find((x) => x.id === u.id)!;
+      sendEmail(d, user, "otp", undefined, code); // delivery is SANDBOX-simulated; code is hashed in state
+    });
+  },
+
+  /** Step 2: verify the code. Single-use, attempt-capped, hash-compared in constant time.
+   *  Success proves email ownership only — payment confirmation still comes from the provider. */
+  async verifyPaymentOtp(code: string) {
+    const u = requireAuth();
+    rateLimit(`otp-verify:${u.id}`, 8, 10 * 60000);
+    const rec = otpRecords.get(u.email);
+    if (!rec || rec.expires < Date.now()) { otpRecords.delete(u.email); throw new ApiError("e.otpExpired"); }
+    if (rec.attempts >= OTP_MAX_ATTEMPTS) { otpRecords.delete(u.email); throw new ApiError("e.otpLocked"); }
+    const ok = timingSafeEqual(await sha256Hex(`${rec.salt}::${code.trim()}`), rec.hash);
+    if (!ok) {
+      rec.attempts += 1;
+      throw new ApiError(rec.attempts >= OTP_MAX_ATTEMPTS ? "e.otpLocked" : "e.otpWrong");
+    }
+    otpRecords.delete(u.email); // one-time use
+    store.mutate((d) => {
+      const user = d.users.find((x) => x.id === u.id)!;
+      user.verified = true; user.verifyToken = null; user.verifyExpires = null;
+    });
+  },
+
   updateProfile(patch: { name?: string }) {
     const u = requireAuth();
     store.mutate((d) => { d.users.find((x) => x.id === u.id)!.name = patch.name?.trim() || u.name; });
@@ -622,11 +675,13 @@ export const api = {
   },
 
   /* ---------- checkout ---------- */
-  placeOrder(couponCode: string | null, paymentMethod: "STRIPE" | "PAYPAL"): Order {
+  placeOrder(couponCode: string | null, paymentMethod: "STRIPE" | "PAYPAL" | "MIR"): Order {
     const u = requireAuth();
     rateLimit(`checkout:${u.id}`, 5, 60000); // A21 — repeated checkout attempts
     const db = store.db;
-    if (!u.verified) throw new ApiError("co.verify");
+    // email ownership must be proven before any payment is initiated (req. 1) —
+    // either at registration (verified) or via the one-time code flow in checkout
+    if (!u.verified) throw new ApiError("e.otpRequired");
     if (db.settings.maintenanceMode) throw new ApiError("e.maintenance");
     const items = currentCartItems();
     if (items.length === 0) throw new ApiError("e.notFound");
@@ -649,10 +704,17 @@ export const api = {
       history: [{ at: Date.now(), state: "PENDING_PAYMENT", by: "customer" }],
       createdAt: Date.now(), paidAt: null, deliveredAt: null,
     };
+    const provId = paymentMethod === "MIR" ? "MIR_ACQUIRER" as const : paymentMethod;
+    const pm = paymentMethod === "MIR" ? "CARD_MIR" as const : paymentMethod === "PAYPAL" ? "PAYPAL" as const : "CARD_INTL" as const;
     store.mutate((d) => {
       d.orderSeq += 1;
       d.orders.unshift(order);
-      d.payments.push({ id: uid("pay"), orderId: order.id, provider: paymentMethod, providerRef: null, amountUsd: order.totalUsd, currency: order.currency, amountMinor: order.totalMinor, status: "PENDING", createdAt: Date.now(), capturedAt: null });
+      d.payments.push({
+        id: uid("pay"), orderId: order.id, provider: provId, providerRef: null,
+        providerCustomerId: null, paymentMethod: pm,
+        amountUsd: order.totalUsd, currency: order.currency, amountMinor: order.totalMinor,
+        status: "PENDING", createdAt: Date.now(), capturedAt: null, updatedAt: Date.now(),
+      });
       // transactional reservation — keys can never be double-sold
       for (const it of order.items) if (it.deliveryMethod === "AUTO") reserveKeys(d, it.productId, it.qty, order.id);
       cartOf(d, u.id).items = [];
@@ -663,25 +725,42 @@ export const api = {
     return order;
   },
 
-  /** Simulates the provider round-trip, then processes a signed webhook event.
-   *  The browser result is irrelevant — only this verified event changes state. */
-  async confirmPayment(orderId: string, cardNumber?: string): Promise<{ duplicate: boolean }> {
+  /** Provider round-trip through the adapter layer. State changes ONLY via a signed,
+   *  verified, deduplicated provider event — the browser's view is never trusted (req. 12).
+   *  SANDBOX: the gateway is local and signs with HMAC; production adapters call the real
+   *  Stripe/PayPal/MIR-acquirer APIs and verification uses each provider's own scheme. */
+  async confirmPayment(orderId: string, testInput?: string): Promise<{ duplicate: boolean }> {
     const u = requireAuth();
     rateLimit(`pay:${u.id}`, 6, 60000); // A21 — payment endpoint abuse
     const db = store.db;
     const order = db.orders.find((o) => o.id === orderId);
     if (!order || order.customerId !== u.id) throw new ApiError("e.notFound");
-    const method = order.paymentMethod.toLowerCase() as "stripe" | "paypal";
-    if (!db.settings[`${method}Enabled` as "stripeEnabled" | "paypalEnabled"]) throw new ApiError("e.gateway");
-    await new Promise((r) => setTimeout(r, 900 + Math.random() * 600));
-    const declined = !!cardNumber && cardNumber.replace(/\s/g, "").endsWith("0002");
-    const attempt = db.paymentEvents.filter((e) => e.orderId === orderId).length;
+    if (order.paymentStatus === "PAID" || order.paymentStatus === "REFUNDED") throw new ApiError("e.transition"); // duplicate-payment protection
+    const pid: ProviderId = order.paymentMethod === "MIR" ? "MIR_ACQUIRER" : order.paymentMethod;
+    const cfg = providerCfg(db.settings, pid);
+    if (!cfg.enabled || !cfg.operational) throw new ApiError("e.gateway");
+    if (!cfg.currencies.includes(order.currency)) throw new ApiError("e.gateway"); // currency support enforced server-side
+
+    const event = await PROVIDERS[pid].settle(order, cfg, testInput);
+
+    // ---- server-side verification (req. 9) ----
+    let ok = await verifyEventSignature(event);                       // signature
+    ok = ok && event.orderId === orderId;                             // internal order id
+    ok = ok && event.amountUsd === order.totalUsd;                    // amount
+    ok = ok && event.currency === order.currency;                     // currency
+    ok = ok && event.provider === pid;                                // merchant/provider
+    if (!ok) throw new ApiError("e.gateway");
+
+    const payment = db.payments.find((p) => p.orderId === orderId);
+    if (payment && payment.status === "PENDING" && event.type === "payment.captured") {
+      payment.status = "REQUIRES_ACTION"; payment.updatedAt = Date.now(); // 3DS-like intermediate state
+    }
     const result = processPaymentEvent(db, {
-      eventId: `evt_${orderId}_${attempt}`, provider: order.paymentMethod,
-      type: declined ? "payment.failed" : "payment.captured", orderId, signatureValid: true,
+      eventId: event.providerEventId, provider: pid, type: event.type, orderId,
+      signatureValid: true, payloadHash: await eventPayloadHash(event), providerPaymentId: event.providerPaymentId,
     });
     store.persist(); store.emit();
-    if (declined) throw new ApiError("e.declined");
+    if (event.type === "payment.failed") throw new ApiError("e.declined");
     return result;
   },
 
@@ -779,7 +858,8 @@ export const api = {
       if (!o || o.paymentStatus !== "PAID") throw new ApiError("e.notPaid");
       const payment = d.payments.find((p) => p.orderId === o.id);
       if (payment) payment.status = "REFUNDED";
-      d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", amountUsd: o.totalUsd, reason, issuedBy: actor.id, createdAt: Date.now() });
+      // SANDBOX: refund id generated inline; production calls the acquirer's refund API
+      d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", providerRefundId: `re_${randomToken(8)}`, status: "SUCCEEDED", amountUsd: o.totalUsd, reason, issuedBy: actor.id, createdAt: Date.now() });
       setPaymentStatus(o, "REFUNDED", staff(actor)); // REFUNDED is terminal — double refund throws
       setFulfillmentStatus(o, "CANCELLED", staff(actor));
       for (const k of d.licenseKeys)
@@ -799,7 +879,7 @@ export const api = {
       if (o.paymentStatus === "PAID") {
         const payment = d.payments.find((p) => p.orderId === o.id);
         if (payment) payment.status = "REFUNDED";
-        d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", amountUsd: o.totalUsd, reason: "Cancelled by staff", issuedBy: actor.id, createdAt: Date.now() });
+        d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", providerRefundId: `re_${randomToken(8)}`, status: "SUCCEEDED", amountUsd: o.totalUsd, reason: "Cancelled by staff", issuedBy: actor.id, createdAt: Date.now() });
         setPaymentStatus(o, "REFUNDED", staff(actor));
       } else {
         setPaymentStatus(o, "FAILED", staff(actor)); // PENDING → FAILED; terminal states throw
@@ -934,6 +1014,30 @@ export const api = {
     store.mutate((d) => {
       d.settings = { ...d.settings, ...patch };
       audit(d, actor, "SETTINGS_CHANGED", Object.keys(patch).join(","), "");
+    });
+  },
+
+  /* ---------- payment provider configuration (req. 6) — OWNER only ----------
+   * Only non-secret flags are stored here (enabled/mode/currencies/operational).
+   * Real credentials live server-side, encrypted at rest, and are never returned
+   * to the client — the UI only ever sees masked merchant labels. */
+  updateProviderConfig(id: ProviderId, patch: Partial<ProviderCfg>) {
+    const actor = requirePerm("payments");
+    if (actor.role !== "OWNER") throw new ApiError("e.forbidden");
+    store.mutate((d) => {
+      const providers = { ...(d.settings.providers ?? JSON.parse(JSON.stringify({})) as object) } as Record<ProviderId, ProviderCfg>;
+      providers[id] = { ...providerCfg(d.settings, id), ...patch, merchantMasked: providerCfg(d.settings, id).merchantMasked }; // credentials never updatable from client
+      d.settings = { ...d.settings, providers };
+      audit(d, actor, "PROVIDER_CONFIG", id, Object.keys(patch).join(","));
+    });
+  },
+
+  updatePaymentRouting(patch: Partial<PaymentRouting>) {
+    const actor = requirePerm("payments");
+    if (actor.role !== "OWNER") throw new ApiError("e.forbidden");
+    store.mutate((d) => {
+      d.settings = { ...d.settings, routing: { ...(d.settings.routing ?? { CARD_INTL: "STRIPE", CARD_MIR: "MIR_ACQUIRER", PAYPAL: "PAYPAL" }), ...patch } };
+      audit(d, actor, "PAYMENT_ROUTING", "routing", Object.entries(patch).map(([k, v]) => `${k}→${v}`).join(","));
     });
   },
 };

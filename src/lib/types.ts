@@ -115,7 +115,7 @@ export interface Order {
   currency: Currency;
   fxRate: number;
   totalMinor: number; // total in `currency` minor units
-  paymentMethod: "STRIPE" | "PAYPAL";
+  paymentMethod: "STRIPE" | "PAYPAL" | "MIR";
   paymentId: string | null;
   paymentStatus: PaymentStatus;
   fulfillmentStatus: FulfillmentStatus;
@@ -127,37 +127,50 @@ export interface Order {
   deliveredAt: number | null;
 }
 
+export type PaymentStatusExtended =
+  | "PENDING" | "REQUIRES_ACTION" | "AUTHORIZED" | "PAID"
+  | "FAILED" | "CANCELLED" | "REFUNDED" | "PARTIALLY_REFUNDED";
+
+/** Payments table (req. 10). */
 export interface Payment {
   id: string;
   orderId: string;
-  provider: "STRIPE" | "PAYPAL";
+  provider: "STRIPE" | "PAYPAL" | "MIR_ACQUIRER";
+  /** = providerPaymentId */
   providerRef: string | null;
+  providerCustomerId: string | null;
+  paymentMethod: "CARD_INTL" | "CARD_MIR" | "PAYPAL";
   amountUsd: number;
   currency: Currency;
   amountMinor: number;
-  status: PaymentStatus;
+  status: PaymentStatusExtended;
   createdAt: number;
   capturedAt: number | null;
+  updatedAt: number;
 }
 
-/** Webhook events — event_id is UNIQUE in production (idempotency). */
+/** payment_events — UNIQUE(provider, providerEventId) in production (req. 10). */
 export interface PaymentEvent {
   eventId: string;
-  provider: "STRIPE" | "PAYPAL";
+  provider: "STRIPE" | "PAYPAL" | "MIR_ACQUIRER";
   type: "payment.captured" | "payment.failed";
   orderId: string;
   signatureValid: boolean;
+  payloadHash: string | null;
   processed: boolean;
   receivedAt: number;
 }
 
+/** Refunds table — providerRefundId from the acquirer (req. 10). */
 export interface Refund {
   id: string;
   orderId: string;
   paymentId: string;
+  providerRefundId: string | null;
   amountUsd: number;
   reason: string;
   issuedBy: string;
+  status: "SUCCEEDED" | "PENDING";
   createdAt: number;
 }
 
@@ -240,6 +253,8 @@ export interface EmailLog {
   status: "SENT" | "FAILED" | "QUEUED";
   provider: string;
   createdAt: number;
+  /** SANDBOX ONLY — real providers never expose one-time codes to client-readable logs. */
+  sandboxCode?: string | null;
 }
 
 export interface Settings {
@@ -260,6 +275,11 @@ export interface Settings {
   emailProvider: "RESEND" | "SES" | "SMTP";
   emailFrom: string;
   requireReviewApproval: boolean;
+  /** Payment provider configuration (req. 6). Credentials themselves are server-side only;
+   *  here we keep enabled/mode/currency/operational flags + masked merchant labels. */
+  providers?: import("./payments").PaymentProviders;
+  /** Payment-method → provider settlement routing (req. 5), OWNER-configurable. */
+  routing?: import("./payments").PaymentRouting;
 }
 
 export interface CartItem { productId: string; qty: number; }

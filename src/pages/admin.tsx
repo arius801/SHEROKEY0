@@ -24,6 +24,7 @@ export function AdminShell({ children }: { children: ReactNode }) {
     ["tickets", t("ad.tickets"), <ILifebuoy size={15} key="g" />, "tickets"],
     ["reviews", t("c.reviews"), <IChart size={15} key="k" />, "products"],
     ["emails", t("ad.emails"), <IMail size={15} key="h" />, "emails"],
+    ["payments", t("ad.payTitle"), <ICoins size={15} key="p" />, "payments"],
     ["audit", t("ad.audit"), <IFile size={15} key="i" />, "audit"],
     ["settings", t("ad.settings"), <IGear size={15} key="j" />, "settings"],
   ];

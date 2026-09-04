@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useApp, api, computeTotals, orderStateKey, currentCartItems } from "../state/store";
+import { availableMethods, providerCfg, type PaymentMethod as PayMethod } from "../lib/payments";
 import { Btn, Empty, Field, Input, KeyField, OrderBadge, Qty, Badge, toast } from "../components/ui";
 import { ICart, ITag, IBolt, IWrench, ICheck, IShield, IStripe, IPaypal, ICard, IArrowR, IAlert, IMail, IClock } from "../components/icons";
 import { formatDate } from "../lib/money";
@@ -104,13 +105,17 @@ const fmtExp = (v: string) => { const d = v.replace(/\D/g, "").slice(0, 4); retu
 export function CheckoutPage() {
   const { db, t, money, user, ui, fmt } = useApp();
   const nav = useNavigate();
-  const [method, setMethod] = useState<"STRIPE" | "PAYPAL">("STRIPE");
+  const [method, setMethod] = useState<PayMethod>("CARD_INTL");
   const [card, setCard] = useState({ num: "", exp: "", cvc: "", name: "" });
   const [code, setCode] = useState(sessionStorage.getItem(COUPON_KEY) ?? "");
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<null | "placing" | "processing">(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [pendingOrderId, setPendingOrderId] = useState<string | null>(null);
+  const [otp, setOtp] = useState("");
+  const [otpBusy, setOtpBusy] = useState(false);
+  const [otpErr, setOtpErr] = useState<string | null>(null);
+  const [otpSent, setOtpSent] = useState(false);
 
   const totals = useMemo(() => computeTotals(currentCartItems(), code || null, user?.currency ?? ui.currency), [db, code, user, ui.currency]);
 
@@ -122,11 +127,35 @@ export function CheckoutPage() {
       </div>
     );
 
+  /* Pre-payment email ownership check (req. 1): one-time code, hashed server-side,
+   * 5-minute TTL, single use. Success proves the inbox only — never the payment. */
   if (!user.verified)
     return (
-      <div className="max-w-2xl mx-auto px-4 py-20">
-        <Empty icon={<IMail size={22} />} title={t("co.verify")} desc={t("co.verifyNote")}
-          action={<Btn variant="soft" onClick={() => { api.resendVerification(); toast(t("au.sent"), "info"); }}>{t("au.resend")}</Btn>} />
+      <div className="max-w-lg mx-auto px-4 py-16">
+        <div className="sk-card p-7 sm:p-9 anim-fade-up">
+          <span className="inline-flex w-12 h-12 rounded-xl bg-volt-500/12 border border-volt-500/30 text-volt-400 items-center justify-center mb-5"><IMail size={20} /></span>
+          <h1 className="font-display text-xl font-extrabold mb-2">{t("co.otpTitle")}</h1>
+          <p className="text-[13.5px] text-dim leading-relaxed mb-6">{t("co.otpDesc", { email: user.email })}</p>
+          <div className="flex flex-col sm:flex-row gap-2.5">
+            <Input value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="••••••" dir="ltr"
+              inputMode="numeric" autoComplete="one-time-code" aria-label={t("co.otpCode")}
+              className="text-center font-mono text-lg tracking-[0.5em] flex-1 min-h-12" />
+            <Btn size="lg" loading={otpBusy} disabled={otp.length !== 6} onClick={async () => {
+              setOtpErr(null); setOtpBusy(true);
+              try { await api.verifyPaymentOtp(otp); toast(t("co.otpOk"), "ok"); }
+              catch (e) { setOtpErr(t((e as { code?: string }).code ?? "e.generic")); setOtp(""); }
+              finally { setOtpBusy(false); }
+            }}>{t("co.otpVerify")}</Btn>
+          </div>
+          {otpErr && <p className="mt-3 text-[12.5px] font-bold text-danger-400 flex items-center gap-2"><IAlert size={13} /> {otpErr}</p>}
+          <div className="flex items-center justify-between gap-3 mt-5 pt-5 border-t border-line">
+            <p className="text-[11.5px] text-faint font-semibold">{otpSent ? t("co.otpSent") : ""}</p>
+            <button className="text-[12.5px] font-bold text-volt-400 hover:underline min-h-11 px-2" onClick={async () => {
+              try { await api.requestPaymentOtp(); setOtpSent(true); toast(t("co.otpSent"), "info"); }
+              catch (e) { setOtpErr(t((e as { code?: string }).code ?? "e.generic")); }
+            }}>{t("co.otpResend")}</button>
+          </div>
+        </div>
       </div>
     );
 
@@ -137,20 +166,31 @@ export function CheckoutPage() {
       </div>
     );
 
+  /* checkout availability (req. 7): only configured + enabled + currency-supported + operational methods */
+  const methods = availableMethods(db.settings, totals.currency);
+  const chosen = methods.find((m) => m.method === method) ?? methods[0];
+  const chosenCfg = providerCfg(db.settings, chosen.provider);
+  const orderMethodFor = (m: PayMethod): "STRIPE" | "PAYPAL" | "MIR" => {
+    const pid = db.settings.routing?.[m] ?? (m === "CARD_MIR" ? "MIR_ACQUIRER" : m === "PAYPAL" ? "PAYPAL" : "STRIPE");
+    return pid === "MIR_ACQUIRER" ? "MIR" : pid;
+  };
+
   const pay = async () => {
     setFailed(null);
+    if (chosen.reason) { setFailed(t(chosen.reason === "currency" ? "co.providerCur" : chosen.reason === "down" ? "co.providerDown" : "co.providerOff", { cur: totals.currency })); return; }
+    const isCard = method !== "PAYPAL";
     try {
-      if (method === "STRIPE" && card.num.replace(/\s/g, "").length < 16) { setFailed(`${t("co.cardNum")} — 4242 4242 4242 4242`); return; }
+      if (isCard && card.num.replace(/\s/g, "").length < 16) { setFailed(`${t("co.cardNum")} — ${method === "CARD_MIR" ? "2200 0000 0000 0004" : "4242 4242 4242 4242"}`); return; }
       setStage("placing");
       const coupon = code.trim() || sessionStorage.getItem(COUPON_KEY);
       let orderId = pendingOrderId;
       if (!orderId) {
-        const order = api.placeOrder(coupon, method);
+        const order = api.placeOrder(coupon, orderMethodFor(method)); // server reprices everything (A24)
         orderId = order.id;
         setPendingOrderId(orderId);
       }
       setStage("processing");
-      await api.confirmPayment(orderId, method === "STRIPE" ? card.num : undefined);
+      await api.confirmPayment(orderId, isCard ? card.num : undefined);
       sessionStorage.removeItem(COUPON_KEY);
       nav(`/order/${orderId}`);
     } catch (e) {
@@ -160,9 +200,6 @@ export function CheckoutPage() {
       else setFailed(t(err.code ?? "e.generic", totals.couponErrorVars));
     }
   };
-
-  const stripeReady = db.settings.stripeEnabled;
-  const paypalReady = db.settings.paypalEnabled;
 
   if (stage)
     return (
@@ -204,23 +241,29 @@ export function CheckoutPage() {
             </div>
           </section>
 
-          {/* method */}
+          {/* method — rendered only when the provider can actually process this currency (req. 7) */}
           <section className="sk-card p-6">
             <h2 className="font-display text-[15px] font-bold mb-4">2 · {t("co.method")}</h2>
-            <div className="grid sm:grid-cols-2 gap-3 mb-5">
-              <button disabled={!stripeReady} onClick={() => setMethod("STRIPE")}
-                className={`p-4 rounded-xl border text-start transition flex items-center gap-3 ${method === "STRIPE" ? "border-volt-500 bg-volt-500/6" : "border-line hover:border-edge"} ${!stripeReady && "opacity-40"}`}>
-                <IStripe size={22} className="text-sky-400" />
-                <span><span className="block text-[13.5px] font-bold">{t("co.card")}</span><span className="text-[11px] text-faint font-semibold">Visa · Mastercard · Amex</span></span>
-              </button>
-              <button disabled={!paypalReady} onClick={() => setMethod("PAYPAL")}
-                className={`p-4 rounded-xl border text-start transition flex items-center gap-3 ${method === "PAYPAL" ? "border-volt-500 bg-volt-500/6" : "border-line hover:border-edge"} ${!paypalReady && "opacity-40"}`}>
-                <IPaypal size={22} className="text-sky-400" />
-                <span><span className="block text-[13.5px] font-bold">{t("co.paypal")}</span><span className="text-[11px] text-faint font-semibold">PayPal balance · cards</span></span>
-              </button>
+            <div className="grid sm:grid-cols-3 gap-3 mb-5" role="radiogroup" aria-label={t("co.method")}>
+              {methods.map((m) => {
+                const active = m.method === method;
+                const reasonKey = m.reason === "currency" ? "co.providerCur" : m.reason === "down" ? "co.providerDown" : m.reason === "disabled" ? "co.providerOff" : null;
+                return (
+                  <button key={m.method} role="radio" aria-checked={active} disabled={!!m.reason} onClick={() => setMethod(m.method)}
+                    className={`p-4 rounded-xl border text-start transition flex items-center gap-3 min-h-16 ${active ? "border-volt-500 bg-volt-500/6" : "border-line hover:border-edge"} ${m.reason ? "opacity-40 cursor-not-allowed" : ""}`}>
+                    {m.method === "PAYPAL" ? <IPaypal size={22} className="text-sky-400 shrink-0" /> : <ICard size={22} className={`${m.method === "CARD_MIR" ? "text-volt-400" : "text-sky-400"} shrink-0`} />}
+                    <span className="min-w-0">
+                      <span className="block text-[13.5px] font-bold">{t(m.method === "CARD_INTL" ? "co.card" : m.method === "CARD_MIR" ? "co.mir" : "co.paypal")}</span>
+                      <span className="block text-[10.5px] text-faint font-semibold truncate">
+                        {reasonKey ? t(reasonKey, { cur: totals.currency }) : m.method === "CARD_INTL" ? "Visa · MC · Amex" : m.method === "CARD_MIR" ? t("co.mirNote") : t("co.paypalNote")}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
             </div>
 
-            {method === "STRIPE" ? (
+            {method !== "PAYPAL" ? (
               <div className="space-y-4 anim-fade">
                 <Field label={t("co.cardNum")}>
                   <Input value={card.num} onChange={(e) => setCard({ ...card, num: fmtCard(e.target.value) })} placeholder="4242 4242 4242 4242" dir="ltr" inputMode="numeric" autoComplete="cc-number" />
@@ -230,7 +273,11 @@ export function CheckoutPage() {
                   <Field label={t("co.cardCvc")}><Input value={card.cvc} onChange={(e) => setCard({ ...card, cvc: e.target.value.replace(/\D/g, "").slice(0, 4) })} placeholder="123" dir="ltr" /></Field>
                   <Field label={t("co.cardName")}><Input value={card.name} onChange={(e) => setCard({ ...card, name: e.target.value })} placeholder="A. CUSTOMER" /></Field>
                 </div>
-                <p className="text-[11.5px] text-faint font-semibold leading-relaxed bg-canvas border border-line rounded-lg px-3.5 py-2.5" dir="ltr">{t("co.testHint")}</p>
+                {chosenCfg.mode === "TEST" && (
+                  <p className="text-[11.5px] text-ember-400 font-bold leading-relaxed bg-ember-500/8 border border-ember-500/25 rounded-lg px-3.5 py-2.5" dir="ltr">
+                    {method === "CARD_MIR" ? t("co.mirTest") : t("co.testMode")} · {chosen.provider}
+                  </p>
+                )}
               </div>
             ) : (
               <p className="text-[13px] text-dim leading-relaxed anim-fade flex gap-2.5 items-start"><IInfo14 /> {t("co.secureNote")}</p>

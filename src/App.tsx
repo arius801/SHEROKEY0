@@ -35,6 +35,7 @@ const AdminEmails = Admin2("AdminEmails");
 const AdminAudit = Admin2("AdminAudit");
 const AdminSettings = Admin2("AdminSettings");
 const AdminReviews = Admin2("AdminReviews");
+const AdminPayments = Admin2("AdminPayments");
 const AdminShellLazy = lazy(() => import("./pages/admin").then((m) => ({ default: m.AdminShell })));
 const LegalPage = lazy(() => import("./pages/static").then((m) => ({ default: m.LegalPage })));
 const NotFound = lazy(() => import("./pages/static").then((m) => ({ default: m.NotFound })));
@@ -180,6 +181,7 @@ export default function App() {
                 <Route path="/admin/emails" element={<AdminShellLazy><AdminEmails /></AdminShellLazy>} />
                 <Route path="/admin/audit" element={<AdminShellLazy><AdminAudit /></AdminShellLazy>} />
                 <Route path="/admin/settings" element={<AdminShellLazy><AdminSettings /></AdminShellLazy>} />
+                <Route path="/admin/payments" element={<AdminShellLazy><AdminPayments /></AdminShellLazy>} />
 
                 <Route path="*" element={<NotFound />} />
               </Routes>

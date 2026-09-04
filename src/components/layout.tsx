@@ -15,7 +15,7 @@ function Logo() {
       <span className="w-9 h-9 rounded-xl bg-volt-500/12 border border-volt-500/30 flex items-center justify-center text-volt-400 group-hover:bg-volt-500 group-hover:text-[#062b1b] transition-all duration-200">
         <IKey size={18} />
       </span>
-      <span className="font-display font-extrabold text-[15px] tracking-tight leading-none">
+      <span className="font-display font-extrabold text-[15px] tracking-tight leading-none hidden min-[400px]:block">
         SHERO<span className="text-volt-400">KEY</span>
         <span className="block text-[8.5px] font-bold tracking-[0.28em] text-faint mt-0.5 uppercase">Digital Vault</span>
       </span>
@@ -139,6 +139,12 @@ function Mailbox() {
               <div className="px-5 py-6 bg-panel text-sm leading-relaxed space-y-3">
                 <p className="font-semibold">{t("mail.hello", { name: selected.toName })}</p>
                 <p className="text-dim">{t("mail.thanks")} <strong className="text-fog">{selected.subject}</strong></p>
+                {selected.sandboxCode && (
+                  <div className="rounded-lg border border-ember-500/30 bg-ember-500/8 p-3.5 text-center">
+                    <p className="text-[10px] font-extrabold uppercase tracking-widest text-ember-400 mb-1">Sandbox delivery</p>
+                    <p className="font-mono text-2xl font-extrabold tracking-[0.35em]" dir="ltr">{selected.sandboxCode}</p>
+                  </div>
+                )}
                 <div className="rounded-lg bg-canvas border border-line p-3.5 font-mono text-[12px] text-dim" dir="ltr">
                   provider: {selected.provider} · lang: {selected.lang} · status: {selected.status}
                 </div>
@@ -270,6 +276,16 @@ function Header() {
               <Logo />
               <button onClick={() => setMobile(false)} className="text-dim p-1.5" aria-label={t("c.close")}><IX size={18} /></button>
             </div>
+            <form className="mb-3" role="search" onSubmit={(e) => {
+              e.preventDefault();
+              const q = String(new FormData(e.currentTarget).get("mq") ?? "").trim();
+              setMobile(false); nav(`/catalog${q ? `?q=${encodeURIComponent(q)}` : ""}`);
+            }}>
+              <div className="relative">
+                <ISearch size={14} className="absolute start-3 top-1/2 -translate-y-1/2 text-faint" />
+                <input name="mq" placeholder={t("hdr.search")} aria-label={t("hdr.search")} className="sk-input ps-8 h-10 !rounded-full text-[13px]" />
+              </div>
+            </form>
             {[["/catalog", t("nav.catalog")], ["/offers", t("nav.offers")], ["/support", t("nav.support")], ["/faq", t("nav.faq")], ["/about", t("nav.about")]].map(([to, label]) => (
               <Link key={to} to={to} onClick={() => setMobile(false)} className="px-3 py-2.5 rounded-lg text-sm font-bold text-dim hover:text-fog hover:bg-raise transition">{label}</Link>
             ))}

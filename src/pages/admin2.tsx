@@ -628,3 +628,105 @@ export function AdminSettings() {
 }
 import { store as storeResetHolder } from "../state/store";
 const storeReset = () => storeResetHolder.resetWorkspace();
+
+/* ================= PAYMENT PROVIDERS (req. 6) — OWNER only ================= */
+import { PROVIDER_META, providerCfg, type ProviderId, type PaymentRouting } from "../lib/payments";
+import { IStripe, IPaypal, ICard, IShield, ICoins } from "../components/icons";
+
+const PROV_ICON: Record<ProviderId, (p: { size?: number; className?: string }) => React.ReactNode> = {
+  STRIPE: (p) => <IStripe {...p} />, PAYPAL: (p) => <IPaypal {...p} />, MIR_ACQUIRER: (p) => <ICard {...p} />,
+};
+
+export function AdminPayments() {
+  const { db, t, user } = useApp();
+  const s = db.settings;
+  const isOwner = user?.role === "OWNER";
+  const routing = s.routing ?? { CARD_INTL: "STRIPE", CARD_MIR: "MIR_ACQUIRER", PAYPAL: "PAYPAL" };
+
+  const toggleCurrency = (id: ProviderId, cur: string) => {
+    const cfg = providerCfg(s, id);
+    const currencies = cfg.currencies.includes(cur as never)
+      ? cfg.currencies.filter((c) => c !== cur)
+      : [...cfg.currencies, cur as never];
+    api.updateProviderConfig(id, { currencies });
+    toast(t("c.saved"));
+  };
+
+  return (
+    <div className="anim-fade space-y-6">
+      <div>
+        <h2 className="font-display text-lg font-extrabold flex items-center gap-2.5"><ICoins size={19} className="text-volt-400" /> {t("ad.payTitle")}</h2>
+        <p className="text-[12.5px] text-dim mt-1 max-w-2xl leading-relaxed">{t("ad.payDesc")}</p>
+        {!isOwner && <p className="mt-2 text-[12px] font-bold text-ember-400 flex items-center gap-1.5"><IShield size={13} /> {t("ad.payOwnerOnly")}</p>}
+      </div>
+
+      <div className="grid lg:grid-cols-3 gap-4">
+        {(Object.keys(PROVIDER_META) as ProviderId[]).map((id) => {
+          const cfg = providerCfg(s, id);
+          const meta = PROVIDER_META[id];
+          return (
+            <section key={id} className={`sk-card p-5 ${!cfg.enabled ? "opacity-70" : ""}`}>
+              <div className="flex items-center gap-3 mb-4">
+                <span className={`w-10 h-10 rounded-xl flex items-center justify-center border ${cfg.enabled ? "bg-volt-500/10 border-volt-500/30 text-volt-400" : "bg-raise border-line text-faint"}`}>
+                  {PROV_ICON[id]({ size: 18 })}
+                </span>
+                <div className="flex-1">
+                  <h3 className="font-display text-[13.5px] font-bold">{meta.label}</h3>
+                  <p className="text-[11px] text-faint font-semibold font-mono" dir="ltr">{t("ad.payMerchant")}: {cfg.merchantMasked}</p>
+                </div>
+                <span className={`w-2 h-2 rounded-full ${cfg.enabled && cfg.operational ? "bg-volt-500" : "bg-danger-500"}`} />
+              </div>
+              <div className="space-y-3.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[12.5px] font-bold text-dim">{t("ad.payEnabled")}</span>
+                  <input type="checkbox" disabled={!isOwner} checked={cfg.enabled} aria-label={`${meta.label} ${t("ad.payEnabled")}`}
+                    onChange={(e) => { api.updateProviderConfig(id, { enabled: e.target.checked }); toast(t("c.saved")); }} className="accent-[#2fc98a] w-4.5 h-4.5" />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[12.5px] font-bold text-dim">{t("ad.payOperational")}</span>
+                  <input type="checkbox" disabled={!isOwner} checked={cfg.operational} aria-label={`${meta.label} ${t("ad.payOperational")}`}
+                    onChange={(e) => { api.updateProviderConfig(id, { operational: e.target.checked }); toast(t("c.saved")); }} className="accent-[#2fc98a] w-4.5 h-4.5" />
+                </div>
+                <Field label={t("ad.payMode")}>
+                  <Select disabled={!isOwner} value={cfg.mode} onChange={(e) => { api.updateProviderConfig(id, { mode: e.target.value as "TEST" | "LIVE" }); toast(t("c.saved")); }}>
+                    <option value="TEST">TEST</option>
+                    <option value="LIVE">LIVE</option>
+                  </Select>
+                </Field>
+                <div>
+                  <p className="text-[11px] font-extrabold uppercase tracking-wider text-faint mb-2">{t("ad.payCur")}</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(["USD", "EUR", "SAR", "RUB"] as const).map((cur) => {
+                      const on = cfg.currencies.includes(cur);
+                      return (
+                        <button key={cur} disabled={!isOwner} onClick={() => toggleCurrency(id, cur)}
+                          className={`px-2.5 py-1.5 rounded-lg border text-[11.5px] font-mono font-bold transition min-h-9 ${on ? "border-volt-500/50 bg-volt-500/10 text-volt-400" : "border-line text-faint hover:border-edge"}`}
+                          aria-pressed={on}>{cur}</button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </section>
+          );
+        })}
+      </div>
+
+      <section className="sk-card p-6">
+        <h3 className="font-display text-[14px] font-bold mb-1.5">{t("ad.payRoutingTitle")}</h3>
+        <p className="text-[12px] text-dim mb-5 leading-relaxed">{t("co.settleNote")}</p>
+        <div className="grid sm:grid-cols-3 gap-4">
+          {([["CARD_INTL", t("ad.payRouteCard"), ["STRIPE", "PAYPAL"]], ["CARD_MIR", t("ad.payRouteMir"), ["MIR_ACQUIRER", "STRIPE"]], ["PAYPAL", t("ad.payRoutePaypal"), ["PAYPAL"]]] as [keyof PaymentRouting, string, ProviderId[]][]).map(([key, label, opts]) => (
+            <Field key={key} label={label}>
+              <Select disabled={!isOwner} value={routing[key]} onChange={(e) => { api.updatePaymentRouting({ [key]: e.target.value } as Partial<PaymentRouting>); toast(t("c.saved")); }}>
+                {opts.map((o) => <option key={o} value={o}>{PROVIDER_META[o].label}</option>)}
+              </Select>
+            </Field>
+          ))}
+        </div>
+      </section>
+
+      <p className="text-[11.5px] text-faint font-semibold flex gap-2 leading-relaxed"><IShield size={13} className="shrink-0 mt-0.5 text-volt-400" /> {t("ad.payCreds")}</p>
+    </div>
+  );
+}
