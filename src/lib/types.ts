@@ -263,6 +263,8 @@ export interface Settings {
 }
 
 export interface CartItem { productId: string; qty: number; }
+/** Cart is scoped to a user — or to an anonymous session id pre-login (A15). */
+export interface Cart { id: string; ownerId: string | null; items: CartItem[]; }
 
 export interface DB {
   users: User[];
@@ -285,7 +287,7 @@ export interface DB {
   auditLogs: AuditLog[];
   emailLogs: EmailLog[];
   settings: Settings;
-  cart: CartItem[];
+  carts: Cart[];
   orderSeq: number;
 }
 

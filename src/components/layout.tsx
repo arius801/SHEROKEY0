@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode, type FormEvent } from "react";
 import { Link, NavLink, useNavigate } from "react-router-dom";
-import { useApp, api, isStaff, store } from "../state/store";
+import { useApp, api, isStaff, store, currentCartItems } from "../state/store";
 import { LANGS } from "../lib/i18n";
 import { CURRENCIES, formatDate } from "../lib/money";
 import { Btn, Badge, Dropdown, DropItem, Modal, ToastHost } from "./ui";
@@ -192,7 +192,7 @@ function Header() {
   const nav = useNavigate();
   const [q, setQ] = useState("");
   const [mobile, setMobile] = useState(false);
-  const cartCount = db.cart.reduce((s, c) => s + c.qty, 0);
+  const cartCount = currentCartItems().reduce((s, c) => s + c.qty, 0);
   const wishCount = user ? db.wishlist.filter((w) => w.userId === user.id).length : 0;
 
   const submit = (e: FormEvent) => { e.preventDefault(); nav(`/catalog?q=${encodeURIComponent(q.trim())}`); };

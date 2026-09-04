@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useApp, api, computeTotals, orderStateKey } from "../state/store";
+import { useApp, api, computeTotals, orderStateKey, currentCartItems } from "../state/store";
 import { Btn, Empty, Field, Input, KeyField, OrderBadge, Qty, Badge, toast } from "../components/ui";
 import { ICart, ITag, IBolt, IWrench, ICheck, IShield, IStripe, IPaypal, ICard, IArrowR, IAlert, IMail, IClock } from "../components/icons";
 import { formatDate } from "../lib/money";
@@ -12,15 +12,16 @@ export function CartPage() {
   const { db, t, money, ui } = useApp();
   const nav = useNavigate();
   const [code, setCode] = useState(sessionStorage.getItem(COUPON_KEY) ?? "");
-  const lines = db.cart.flatMap((c) => {
+  const items = currentCartItems();
+  const lines = items.flatMap((c) => {
     const p = db.products.find((x) => x.id === c.productId);
     return p ? [{ ...c, p }] : [];
   });
-  const totals = useMemo(() => computeTotals(db.cart, sessionStorage.getItem(COUPON_KEY), ui.currency), [db, ui.currency]);
+  const totals = useMemo(() => computeTotals(items, sessionStorage.getItem(COUPON_KEY), ui.currency), [db, ui.currency]);
 
   const applyCoupon = () => {
     if (!code.trim()) return;
-    const v = computeTotals(db.cart, code, ui.currency);
+    const v = computeTotals(items, code, ui.currency);
     if (v.couponError) { toast(t(v.couponError, v.couponErrorVars), "err"); return; }
     sessionStorage.setItem(COUPON_KEY, code.trim().toUpperCase());
     toast(t("c.couponOk"), "ok");
@@ -111,7 +112,7 @@ export function CheckoutPage() {
   const [failed, setFailed] = useState<string | null>(null);
   const [pendingOrderId, setPendingOrderId] = useState<string | null>(null);
 
-  const totals = useMemo(() => computeTotals(db.cart, code || null, user?.currency ?? ui.currency), [db, code, user, ui.currency]);
+  const totals = useMemo(() => computeTotals(currentCartItems(), code || null, user?.currency ?? ui.currency), [db, code, user, ui.currency]);
 
   if (!user)
     return (
@@ -129,7 +130,7 @@ export function CheckoutPage() {
       </div>
     );
 
-  if (db.cart.length === 0 && !pendingOrderId)
+  if (currentCartItems().length === 0 && !pendingOrderId)
     return (
       <div className="max-w-2xl mx-auto px-4 py-20">
         <Empty icon={<ICart size={22} />} title={t("cart.empty")} desc={t("cart.emptyDesc")} action={<Btn onClick={() => nav("/catalog")}>{t("c.continue")}</Btn>} />

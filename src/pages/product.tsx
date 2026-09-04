@@ -21,18 +21,43 @@ export default function ProductPage() {
   const [rating, setRating] = useState(5);
   const [text, setText] = useState("");
 
-  useEffect(() => {
-    if (p) {
-      document.title = p.seoTitle;
-      const meta = document.querySelector('meta[name="description"]');
-      if (meta) meta.setAttribute("content", p.seoDescription);
-    }
-    return () => { document.title = "SHEROKEY — Digital Keys, Licenses & Subscriptions"; };
-  }, [p]);
-
   const stock = p ? availableStock(db, p) : 0;
   const { avg, count } = productRating(db, p?.id ?? "");
   const sales = productSales(db, p?.id ?? "");
+
+  useEffect(() => {
+    if (!p) return;
+    document.title = p.seoTitle; // A27: per-product SEO metadata (production: server-rendered)
+    const upsert = (attr: "name" | "property", key: string, content: string) => {
+      let el = document.head.querySelector<HTMLMetaElement>(`meta[${attr}="${key}"]`);
+      if (!el) { el = document.createElement("meta"); el.setAttribute(attr, key); document.head.appendChild(el); }
+      el.setAttribute("content", content);
+    };
+    upsert("name", "description", p.seoDescription);
+    upsert("property", "og:title", p.seoTitle);
+    upsert("property", "og:description", p.seoDescription);
+    upsert("property", "og:image", p.image);
+    upsert("property", "og:type", "product");
+    let script = document.getElementById("sk-jsonld-product") as HTMLScriptElement | null;
+    if (!script) {
+      script = document.createElement("script");
+      script.type = "application/ld+json";
+      script.id = "sk-jsonld-product";
+      document.head.appendChild(script);
+    }
+    script.textContent = JSON.stringify({
+      "@context": "https://schema.org", "@type": "Product",
+      name: p.name.en, description: p.seoDescription, image: p.image,
+      sku: p.slug, brand: { "@type": "Brand", name: "SHEROKEY" },
+      offers: { "@type": "Offer", priceCurrency: "USD", price: (p.priceUsd / 100).toFixed(2), availability: stock > 0 ? "https://schema.org/InStock" : "https://schema.org/OutOfStock" },
+      aggregateRating: count > 0 ? { "@type": "AggregateRating", ratingValue: avg.toFixed(1), reviewCount: count } : undefined,
+    });
+    return () => {
+      document.title = "SHEROKEY — Digital Keys, Licenses & Subscriptions";
+      document.getElementById("sk-jsonld-product")?.remove();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [p?.id, stock, count]);
   const lang = user?.lang ?? "en";
   const reviews = useMemo(() => db.reviews.filter((r) => r.productId === p?.id && r.approved), [db.reviews, p]);
   const purchased = !!user && db.orders.some((o) => o.customerId === user.id && o.paymentStatus !== "FAILED" && o.items.some((i) => i.productId === p?.id));

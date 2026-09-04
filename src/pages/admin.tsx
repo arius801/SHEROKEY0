@@ -37,6 +37,9 @@ export function AdminShell({ children }: { children: ReactNode }) {
           <p className="text-[12px] text-faint font-semibold">{user.name} · {user.role}</p>
         </div>
       </div>
+      <div className="px-6 pb-4 -mt-2">
+        <p className="text-[11px] font-semibold text-ember-400/90 bg-ember-500/8 border border-ember-500/25 rounded-lg px-3 py-2 leading-relaxed">{t("ad.sandboxNote")}</p>
+      </div>
       <div className="grid lg:grid-cols-[210px_1fr] gap-7 items-start">
         <nav className="sk-card p-2 lg:sticky lg:top-28 flex lg:flex-col gap-1 overflow-x-auto">
           {items.map(([key, label, icon, perm]) => {

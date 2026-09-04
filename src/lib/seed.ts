@@ -446,6 +446,6 @@ export async function buildSeed(): Promise<DB> {
     categories, products, licenseKeys, orders, payments, paymentEvents, refunds, coupons, reviews,
     wishlist: [{ userId: demo.id, productId: "p-nordvpn" }, { userId: demo.id, productId: "p-psn" }],
     notifications, tickets, ticketMessages, auditLogs, emailLogs, settings,
-    cart: [], orderSeq: seq,
+    carts: [], orderSeq: seq,
   };
 }

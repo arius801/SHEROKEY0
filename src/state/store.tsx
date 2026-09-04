@@ -6,8 +6,9 @@
 
 import { useSyncExternalStore } from "react";
 import type {
-  CartItem, Coupon, Currency, DB, DeliveryPayload, Lang, Order, Product, Role, Theme, User,
+  Cart, CartItem, Coupon, Currency, DB, DeliveryPayload, Lang, Order, Product, Role, Theme, User,
 } from "../lib/types";
+import { vCouponCode, vEmail, vKeyLines, vPassword, vTicketBody, vTicketSubject } from "../lib/validate";
 import { ApiError } from "../lib/types";
 import { buildSeed } from "../lib/seed";
 import { hashPassword, makeSalt, randomToken, uid, verifyPassword } from "../lib/crypto";
@@ -23,48 +24,127 @@ const DAY = 86400000;
 
 export interface Toast { id: string; msg: string; kind: "ok" | "err" | "info"; }
 
+const ANON_KEY = "sherokey.anon.v1";
+/** Anonymous session id for pre-login carts (A15). Harmless UI state only —
+ *  production replaces this with a server-issued anonymous session cookie. */
+function anonId(): string {
+  try {
+    let id = localStorage.getItem(ANON_KEY);
+    if (!id) { id = uid("anon"); localStorage.setItem(ANON_KEY, id); }
+    return id;
+  } catch { return "anon-ephemeral"; }
+}
+
+/** In-sandbox rate limiter (A21). Production: Redis-backed, keyed by IP + account. */
+const rlBuckets = new Map<string, number[]>();
+function rateLimit(bucket: string, max: number, windowMs: number) {
+  const now = Date.now();
+  const hits = (rlBuckets.get(bucket) ?? []).filter((t) => t > now - windowMs);
+  if (hits.length >= max) { rlBuckets.set(bucket, hits); throw new ApiError("e.rateLimit"); }
+  hits.push(now);
+  rlBuckets.set(bucket, hits);
+}
+
+/** Shape guard for restored workspaces — corrupted payloads reseed instead of crashing. */
+function isShapedDb(x: unknown): x is DB {
+  if (!x || typeof x !== "object") return false;
+  const d = x as Record<string, unknown>;
+  return Array.isArray(d.users) && Array.isArray(d.products) && Array.isArray(d.orders)
+    && Array.isArray(d.licenseKeys) && Array.isArray(d.coupons)
+    && !!d.settings && typeof d.settings === "object";
+}
+
+/** Migrate legacy workspaces (shared `cart`) to user-scoped carts (A15). */
+function migrateLegacy(db: DB) {
+  const d = db as DB & { cart?: CartItem[] };
+  if (!Array.isArray(db.carts)) {
+    const legacy = Array.isArray(d.cart) ? d.cart.filter((i) => i && typeof i.productId === "string" && typeof i.qty === "number") : [];
+    db.carts = legacy.length ? [{ id: uid("c"), ownerId: null, items: legacy }] : [];
+  }
+  delete d.cart;
+}
+
 class Store {
-  db!: DB;
-  ui: { lang: Lang; currency: Currency; theme: Theme; ready: boolean } = {
-    lang: "en", currency: "USD", theme: "dark", ready: false,
+  private _db: DB | null = null;
+  ui: { lang: Lang; currency: Currency; theme: Theme; ready: boolean; initError: string | null } = {
+    lang: "en", currency: "USD", theme: "dark", ready: false, initError: null,
   };
   toasts: Toast[] = [];
   v = 0;
   private listeners = new Set<() => void>();
+  private initPromise: Promise<void> | null = null;
 
   subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
   emit = () => { this.v++; this.listeners.forEach((fn) => fn()); };
 
+  /** Throws only if touched before init — pages render exclusively after ready=true (A1). */
+  get db(): DB {
+    if (!this._db) throw new ApiError("e.notReady");
+    return this._db;
+  }
+  get hasDb(): boolean { return this._db !== null; }
+
   /** mutate() = a database transaction. All writes go through here. */
-  mutate(fn: (db: DB) => void) { fn(this.db); this.persist(); this.emit(); }
+  mutate(fn: (db: DB) => void) {
+    if (!this._db) throw new ApiError("e.notReady");
+    fn(this._db); this.persist(); this.emit();
+  }
 
   persist() {
+    if (!this._db) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ db: this.db, ui: { lang: this.ui.lang, currency: this.ui.currency, theme: this.ui.theme } }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ db: this._db, ui: { lang: this.ui.lang, currency: this.ui.currency, theme: this.ui.theme } }));
     } catch { /* storage full/blocked — session continues in memory */ }
   }
 
-  async init() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        this.db = parsed.db as DB;
-        if (parsed.ui) { this.ui.lang = parsed.ui.lang; this.ui.currency = parsed.ui.currency; this.ui.theme = parsed.ui.theme; }
+  /** Deterministic startup (A1): restore → validate shape → migrate → session restore → ready.
+   *  Idempotent: StrictMode double-effects and duplicate calls share one promise. */
+  init(): Promise<void> {
+    if (this.ui.ready) return Promise.resolve();
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = (async () => {
+      let restored: DB | null = null;
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as { db?: unknown; ui?: { lang?: Lang; currency?: Currency; theme?: Theme } };
+          if (isShapedDb(parsed.db)) {
+            restored = parsed.db;
+            if (parsed.ui) {
+              if (parsed.ui.lang) this.ui.lang = parsed.ui.lang;
+              if (parsed.ui.currency) this.ui.currency = parsed.ui.currency;
+              if (parsed.ui.theme) this.ui.theme = parsed.ui.theme;
+            }
+          }
+          // unshaped payload → fall through and reseed
+        }
+      } catch { /* corrupted JSON → reseed */ }
+      try {
+        this._db = restored ?? (await buildSeed());
+        migrateLegacy(this._db);
+        if (this._db.sessionExpires && this._db.sessionExpires < Date.now()) {
+          this._db.sessionUserId = null; this._db.sessionToken = null; this._db.sessionExpires = null;
+        }
+        this.ui.ready = true;
+        this.ui.initError = null;
+        this.persist();
+      } catch (e) {
+        this._db = null;
+        this.ui.ready = false;
+        this.ui.initError = e instanceof Error ? e.message : "initialization failed";
       }
-    } catch { /* corrupted — reseed */ }
-    if (!this.db) this.db = await buildSeed();
-    if (this.db.sessionExpires && this.db.sessionExpires < Date.now()) {
-      this.db.sessionUserId = null; this.db.sessionToken = null; this.db.sessionExpires = null;
-    }
-    this.ui.ready = true;
-    this.persist();
-    this.emit();
+      this.emit();
+    })();
+    return this.initPromise;
   }
 
+  retryInit = () => { this.initPromise = null; this.ui.initError = null; this.emit(); return this.init(); };
+
   resetWorkspace = async () => {
-    localStorage.removeItem(STORAGE_KEY);
-    this.db = await buildSeed();
+    try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+    this._db = await buildSeed();
+    this.ui.ready = true;
+    this.ui.initError = null;
     this.persist(); this.emit();
   };
 
@@ -90,21 +170,24 @@ export function useApp() {
   useSyncExternalStore(store.subscribe, () => store.v);
   const lang = store.ui.lang;
   const currency = store.ui.currency;
+  const FX_FALLBACK = { USD: 1, EUR: 1, SAR: 1, RUB: 1 } as Record<Currency, number>;
   return {
-    db: store.db,
+    // only touched by views rendered after ui.ready — never dereferenced pre-init (A1)
+    db: (store.hasDb ? store.db : null) as DB,
     ui: store.ui,
     toasts: store.toasts,
     t: (key: string, vars?: Record<string, string | number>) => tr(lang, key, vars),
     dir: langDir(lang),
     money: (usdMinor: number, cur?: Currency) =>
-      formatMoney(convertFromUsd(usdMinor, store.db.settings.fx, cur ?? currency), cur ?? currency, lang),
+      formatMoney(convertFromUsd(usdMinor, store.hasDb ? store.db.settings.fx : FX_FALLBACK, cur ?? currency), cur ?? currency, lang),
     fmt: (minor: number, cur: Currency) => formatMoney(minor, cur, lang),
     user: currentUser(),
   };
 }
 
 function currentUser(): User | null {
-  const { db } = store;
+  if (!store.hasDb) return null; // pre-init render — must never crash (A1)
+  const db = store.db;
   if (!db.sessionUserId || !db.sessionExpires || db.sessionExpires < Date.now()) return null;
   return db.users.find((u) => u.id === db.sessionUserId) ?? null;
 }
@@ -168,6 +251,30 @@ function notify(db: DB, userId: string, type: string, vars?: Record<string, stri
 
 export function availableStock(db: DB, p: Product): number {
   return p.deliveryMethod === "AUTO" ? db.licenseKeys.filter((k) => k.productId === p.id && k.status === "UNUSED").length : p.stock;
+}
+
+/* ---------- cart helpers (A15): one cart per user or anonymous session ---------- */
+function cartOf(db: DB, ownerId: string | null): Cart {
+  let c = db.carts.find((x) => x.ownerId === ownerId);
+  if (!c) { c = { id: uid("c"), ownerId, items: [] }; db.carts.push(c); }
+  return c;
+}
+const currentOwner = (): string | null => currentUser()?.id ?? anonId();
+export function currentCartItems(): CartItem[] {
+  if (!store.hasDb) return [];
+  return store.db.carts.find((x) => x.ownerId === currentOwner())?.items ?? [];
+}
+/** On login/register the anonymous cart folds into the account cart. */
+function mergeAnonCart(d: DB, userId: string) {
+  const anon = d.carts.find((x) => x.ownerId === anonId());
+  if (!anon || anon.items.length === 0) return;
+  const target = cartOf(d, userId);
+  for (const it of anon.items) {
+    const line = target.items.find((l) => l.productId === it.productId);
+    if (line) line.qty = Math.min(line.qty + it.qty, 5);
+    else target.items.push({ productId: it.productId, qty: it.qty });
+  }
+  anon.items = [];
 }
 
 export function validateCoupon(db: DB, code: string, subtotalUsd: number, customerId: string | null, productIds: string[]):
@@ -260,6 +367,41 @@ function deliverReserved(db: DB, order: Order): string[] {
 }
 
 /* ------------------------------------------------------------------ */
+/* Order state machine (A14) — payment and fulfillment lifecycles are  */
+/* separate, and only whitelisted transitions are legal. Every change  */
+/* writes order status history.                                        */
+/* ------------------------------------------------------------------ */
+
+type PaymentStatus = Order["paymentStatus"];
+type FulfillmentStatus = Order["fulfillmentStatus"];
+
+const PAYMENT_TRANSITIONS: Record<PaymentStatus, PaymentStatus[]> = {
+  PENDING: ["PAID", "FAILED"],
+  PAID: ["REFUNDED"],
+  FAILED: [],
+  REFUNDED: [],
+};
+const FULFILL_TRANSITIONS: Record<FulfillmentStatus, FulfillmentStatus[]> = {
+  PENDING: ["PROCESSING", "DELIVERED", "CANCELLED"],
+  PROCESSING: ["DELIVERED", "CANCELLED"],
+  DELIVERED: ["COMPLETED", "CANCELLED"],
+  COMPLETED: [],
+  CANCELLED: [],
+};
+
+function setPaymentStatus(o: Order, next: PaymentStatus, by: string) {
+  if (!PAYMENT_TRANSITIONS[o.paymentStatus].includes(next)) throw new ApiError("e.transition");
+  o.paymentStatus = next;
+  o.history.push({ at: Date.now(), state: next, by });
+}
+function setFulfillmentStatus(o: Order, next: FulfillmentStatus, by: string) {
+  if (!FULFILL_TRANSITIONS[o.fulfillmentStatus].includes(next)) throw new ApiError("e.transition");
+  o.fulfillmentStatus = next;
+  if (next === "DELIVERED") o.deliveredAt = Date.now();
+  o.history.push({ at: Date.now(), state: next, by });
+}
+
+/* ------------------------------------------------------------------ */
 /* Fulfillment — independent from the payment UI. Runs only after a    */
 /* verified provider event.                                            */
 /* ------------------------------------------------------------------ */
@@ -269,14 +411,11 @@ function fulfill(db: DB, order: Order) {
   const hasManual = order.items.some((i) => i.deliveryMethod === "MANUAL");
   if (hasAuto) {
     const keys = deliverReserved(db, order);
-    for (const it of order.items) if (it.deliveryMethod === "MANUAL") { /* handled by operator */ }
     order.delivery = { keys, activationCode: null, account: null, downloadLink: null, notes: null };
-    order.fulfillmentStatus = hasManual ? "PROCESSING" : "DELIVERED";
+    setFulfillmentStatus(order, hasManual ? "PROCESSING" : "DELIVERED", "fulfillment");
   } else {
-    order.fulfillmentStatus = "PROCESSING"; // manual queue
+    setFulfillmentStatus(order, "PROCESSING", "fulfillment"); // manual queue
   }
-  if (order.fulfillmentStatus === "DELIVERED") order.deliveredAt = Date.now();
-  order.history.push({ at: Date.now(), state: order.fulfillmentStatus, by: "fulfillment" });
 
   const customer = db.users.find((u) => u.id === order.customerId);
   if (customer) {
@@ -295,7 +434,8 @@ function fulfill(db: DB, order: Order) {
 
 function processPaymentEvent(db: DB, event: { eventId: string; provider: "STRIPE" | "PAYPAL"; type: "payment.captured" | "payment.failed"; orderId: string; signatureValid: boolean }) {
   if (!event.signatureValid) throw new ApiError("e.gateway");
-  const existing = db.paymentEvents.find((e) => e.eventId === event.eventId);
+  // idempotency (A9): UNIQUE(provider, event_id) — replays return safely, nothing duplicates
+  const existing = db.paymentEvents.find((e) => e.provider === event.provider && e.eventId === event.eventId);
   if (existing?.processed) return { duplicate: true }; // duplicate webhook — ignored
   db.paymentEvents.push({ ...event, processed: true, receivedAt: Date.now() });
 
@@ -306,9 +446,8 @@ function processPaymentEvent(db: DB, event: { eventId: string; provider: "STRIPE
   if (event.type === "payment.captured") {
     if (payment) { payment.status = "PAID"; payment.capturedAt = Date.now(); payment.providerRef = `pi_${randomToken(8)}`; }
     order.paymentId = payment?.providerRef ?? null;
-    order.paymentStatus = "PAID";
+    setPaymentStatus(order, "PAID", `webhook:${event.provider.toLowerCase()}`);
     order.paidAt = Date.now();
-    order.history.push({ at: Date.now(), state: "PAID", by: `webhook:${event.provider.toLowerCase()}` });
     if (order.couponCode) {
       const c = db.coupons.find((x) => x.code === order.couponCode);
       if (c) c.uses += 1;
@@ -318,9 +457,8 @@ function processPaymentEvent(db: DB, event: { eventId: string; provider: "STRIPE
     fulfill(db, order);
   } else {
     if (payment) { payment.status = "FAILED"; }
-    order.paymentStatus = "FAILED";
-    order.fulfillmentStatus = "CANCELLED";
-    order.history.push({ at: Date.now(), state: "FAILED", by: `webhook:${event.provider.toLowerCase()}` });
+    setPaymentStatus(order, "FAILED", `webhook:${event.provider.toLowerCase()}`);
+    setFulfillmentStatus(order, "CANCELLED", `webhook:${event.provider.toLowerCase()}`);
     releaseReserved(db, order.id);
     const customer = db.users.find((u) => u.id === order.customerId);
     if (customer) sendEmail(db, customer, "payment_failed", order.number);
@@ -351,6 +489,7 @@ export const api = {
     store.mutate((d) => {
       d.users.push(user);
       d.sessionUserId = user.id; d.sessionToken = randomToken(); d.sessionExpires = Date.now() + 7 * DAY;
+      mergeAnonCart(d, user.id);
       sendEmail(d, user, "welcome");
       sendEmail(d, user, "verify");
       notify(d, user.id, "n.welcome", undefined, "/account");
@@ -359,6 +498,7 @@ export const api = {
   },
 
   async login(email: string, password: string) {
+    rateLimit("login", 12, 60000); // A21 — per-account lockout below adds a second layer
     const db = store.db;
     const user = db.users.find((u) => u.email === email.trim().toLowerCase());
     if (!user) throw new ApiError("au.wrong");
@@ -376,6 +516,7 @@ export const api = {
       const u = d.users.find((x) => x.id === user.id)!;
       u.failedLogins = 0; u.lockedUntil = null;
       d.sessionUserId = u.id; d.sessionToken = randomToken(); d.sessionExpires = Date.now() + 7 * DAY;
+      mergeAnonCart(d, u.id);
     });
     return user;
   },
@@ -383,6 +524,7 @@ export const api = {
   logout() { store.mutate((d) => { d.sessionUserId = null; d.sessionToken = null; d.sessionExpires = null; }); },
 
   async requestReset(email: string) {
+    rateLimit("reset", 3, 10 * 60000); // A21
     const user = store.db.users.find((u) => u.email === email.trim().toLowerCase());
     if (user)
       store.mutate((d) => {
@@ -415,6 +557,7 @@ export const api = {
   },
 
   resendVerification() {
+    rateLimit("verify", 3, 10 * 60000); // A21
     const u = requireAuth();
     store.mutate((d) => {
       const user = d.users.find((x) => x.id === u.id)!;
@@ -437,29 +580,38 @@ export const api = {
     store.mutate((d) => { const x = d.users.find((y) => y.id === u.id)!; x.salt = salt; x.passwordHash = hash; });
   },
 
-  /* ---------- cart & wishlist ---------- */
+  /* ---------- cart (scoped per user / anonymous session — A15) & wishlist ---------- */
   addToCart(productId: string, qty = 1) {
     const p = store.db.products.find((x) => x.id === productId);
     if (!p || !p.active) throw new ApiError("e.notFound");
     const stock = availableStock(store.db, p);
     if (stock < 1) throw new ApiError("e.outOfStock");
+    const owner = currentOwner();
     store.mutate((d) => {
-      const line = d.cart.find((c) => c.productId === productId);
+      const cart = cartOf(d, owner);
+      const line = cart.items.find((c) => c.productId === productId);
       const next = Math.min((line?.qty ?? 0) + qty, stock, 5);
-      if (line) line.qty = next; else d.cart.push({ productId, qty: Math.min(qty, stock, 5) });
+      if (line) line.qty = next; else cart.items.push({ productId, qty: Math.min(qty, stock, 5) });
     });
   },
   setCartQty(productId: string, qty: number) {
     const p = store.db.products.find((x) => x.id === productId);
     const stock = p ? availableStock(store.db, p) : 0;
+    const owner = currentOwner();
     store.mutate((d) => {
-      const line = d.cart.find((c) => c.productId === productId);
+      const line = cartOf(d, owner).items.find((c) => c.productId === productId);
       if (!line) return;
       line.qty = Math.max(1, Math.min(qty, stock, 5));
     });
   },
-  removeFromCart(productId: string) { store.mutate((d) => { d.cart = d.cart.filter((c) => c.productId !== productId); }); },
-  clearCart() { store.mutate((d) => { d.cart = []; }); },
+  removeFromCart(productId: string) {
+    const owner = currentOwner();
+    store.mutate((d) => { const c = d.carts.find((x) => x.ownerId === owner); if (c) c.items = c.items.filter((i) => i.productId !== productId); });
+  },
+  clearCart() {
+    const owner = currentOwner();
+    store.mutate((d) => { const c = d.carts.find((x) => x.ownerId === owner); if (c) c.items = []; });
+  },
 
   toggleWishlist(productId: string) {
     const u = requireAuth();
@@ -472,15 +624,18 @@ export const api = {
   /* ---------- checkout ---------- */
   placeOrder(couponCode: string | null, paymentMethod: "STRIPE" | "PAYPAL"): Order {
     const u = requireAuth();
+    rateLimit(`checkout:${u.id}`, 5, 60000); // A21 — repeated checkout attempts
     const db = store.db;
     if (!u.verified) throw new ApiError("co.verify");
     if (db.settings.maintenanceMode) throw new ApiError("e.maintenance");
-    if (db.cart.length === 0) throw new ApiError("e.notFound");
-    for (const it of db.cart) {
+    const items = currentCartItems();
+    if (items.length === 0) throw new ApiError("e.notFound");
+    for (const it of items) {
       const p = db.products.find((x) => x.id === it.productId);
       if (!p || !p.active || availableStock(db, p) < it.qty) throw new ApiError("e.outOfStock");
     }
-    const totals = computeTotals(db.cart, couponCode, u.currency);
+    if (couponCode && !vCouponCode(couponCode)) throw new ApiError("e.couponCode");
+    const totals = computeTotals(items, couponCode, u.currency); // server-side repricing (A24)
     if (couponCode && totals.couponError) throw new ApiError(totals.couponError);
 
     const order: Order = {
@@ -500,7 +655,9 @@ export const api = {
       d.payments.push({ id: uid("pay"), orderId: order.id, provider: paymentMethod, providerRef: null, amountUsd: order.totalUsd, currency: order.currency, amountMinor: order.totalMinor, status: "PENDING", createdAt: Date.now(), capturedAt: null });
       // transactional reservation — keys can never be double-sold
       for (const it of order.items) if (it.deliveryMethod === "AUTO") reserveKeys(d, it.productId, it.qty, order.id);
-      d.cart = [];
+      cartOf(d, u.id).items = [];
+      const anon = d.carts.find((x) => x.ownerId === anonId());
+      if (anon) anon.items = [];
       notify(d, u.id, "n.order", { n: order.number }, `/account/orders/${order.id}`);
     });
     return order;
@@ -510,6 +667,7 @@ export const api = {
    *  The browser result is irrelevant — only this verified event changes state. */
   async confirmPayment(orderId: string, cardNumber?: string): Promise<{ duplicate: boolean }> {
     const u = requireAuth();
+    rateLimit(`pay:${u.id}`, 6, 60000); // A21 — payment endpoint abuse
     const db = store.db;
     const order = db.orders.find((o) => o.id === orderId);
     if (!order || order.customerId !== u.id) throw new ApiError("e.notFound");
@@ -544,6 +702,8 @@ export const api = {
 
   createTicket(subject: string, orderId: string | null, message: string) {
     const u = requireAuth();
+    rateLimit(`ticket:${u.id}`, 5, 30 * 60000); // A21 — support abuse
+    if (!vTicketSubject(subject) || !vTicketBody(message)) throw new ApiError("e.generic");
     const id = uid("tk");
     store.mutate((d) => {
       d.tickets.unshift({ id, customerId: u.id, orderId, subject: subject.trim(), status: "OPEN", assignee: null, createdAt: Date.now(), updatedAt: Date.now() });
@@ -591,12 +751,10 @@ export const api = {
     store.mutate((d) => {
       const o = d.orders.find((x) => x.id === orderId);
       if (!o) throw new ApiError("e.notFound");
-      if (o.paymentStatus !== "PAID") throw new ApiError("e.notPaid"); // never deliver unpaid orders
+      if (o.paymentStatus !== "PAID") throw new ApiError("e.notPaid"); // never deliver unpaid orders (A13)
       o.delivery = { ...payload, keys: [...(o.delivery?.keys ?? []), ...payload.keys] }; // merge with auto-delivered keys
-      o.fulfillmentStatus = "DELIVERED";
-      o.deliveredAt = Date.now();
       o.deliveredBy = actor.id;
-      o.history.push({ at: Date.now(), state: "DELIVERED", by: `manual:${actor.name}` });
+      setFulfillmentStatus(o, "DELIVERED", `manual:${actor.name}`); // repeated delivery → e.transition
       const customer = d.users.find((x) => x.id === o.customerId);
       if (customer) { sendEmail(d, customer, "delivered", o.number); notify(d, customer.id, "n.delivered", { n: o.number }, `/account/orders/${o.id}`); }
       audit(d, actor, "MANUAL_DELIVERED", o.number, payload.keys.length ? `${payload.keys.length} key(s)` : payload.account ? "account credentials" : "delivery data");
@@ -607,9 +765,8 @@ export const api = {
     const actor = requirePerm("orders");
     store.mutate((d) => {
       const o = d.orders.find((x) => x.id === orderId);
-      if (!o || o.fulfillmentStatus !== "DELIVERED") throw new ApiError("e.forbidden");
-      o.fulfillmentStatus = "COMPLETED";
-      o.history.push({ at: Date.now(), state: "COMPLETED", by: staff(actor) });
+      if (!o) throw new ApiError("e.notFound");
+      setFulfillmentStatus(o, "COMPLETED", staff(actor)); // only DELIVERED → COMPLETED
       for (const k of d.licenseKeys) if (k.orderId === o.id && k.status === "DELIVERED") k.status = "USED";
       audit(d, actor, "ORDER_COMPLETED", o.number, "");
     });
@@ -623,8 +780,8 @@ export const api = {
       const payment = d.payments.find((p) => p.orderId === o.id);
       if (payment) payment.status = "REFUNDED";
       d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", amountUsd: o.totalUsd, reason, issuedBy: actor.id, createdAt: Date.now() });
-      o.paymentStatus = "REFUNDED"; o.fulfillmentStatus = "CANCELLED";
-      o.history.push({ at: Date.now(), state: "REFUNDED", by: staff(actor) });
+      setPaymentStatus(o, "REFUNDED", staff(actor)); // REFUNDED is terminal — double refund throws
+      setFulfillmentStatus(o, "CANCELLED", staff(actor));
       for (const k of d.licenseKeys)
         if (k.orderId === o.id) { if (k.status === "DELIVERED" || k.status === "USED") k.status = "REVOKED"; else if (k.status === "RESERVED") { k.status = "UNUSED"; k.orderId = null; } }
       const customer = d.users.find((x) => x.id === o.customerId);
@@ -637,16 +794,17 @@ export const api = {
     const actor = requirePerm("cancel");
     store.mutate((d) => {
       const o = d.orders.find((x) => x.id === orderId);
-      if (!o || o.paymentStatus === "REFUNDED") throw new ApiError("e.forbidden");
+      if (!o) throw new ApiError("e.notFound");
       releaseReserved(d, o.id);
       if (o.paymentStatus === "PAID") {
         const payment = d.payments.find((p) => p.orderId === o.id);
         if (payment) payment.status = "REFUNDED";
         d.refunds.unshift({ id: uid("rf"), orderId: o.id, paymentId: payment?.id ?? "", amountUsd: o.totalUsd, reason: "Cancelled by staff", issuedBy: actor.id, createdAt: Date.now() });
-        o.paymentStatus = "REFUNDED";
-      } else o.paymentStatus = "FAILED";
-      o.fulfillmentStatus = "CANCELLED";
-      o.history.push({ at: Date.now(), state: "CANCELLED", by: staff(actor) });
+        setPaymentStatus(o, "REFUNDED", staff(actor));
+      } else {
+        setPaymentStatus(o, "FAILED", staff(actor)); // PENDING → FAILED; terminal states throw
+      }
+      setFulfillmentStatus(o, "CANCELLED", staff(actor));
       const customer = d.users.find((x) => x.id === o.customerId);
       if (customer) { sendEmail(d, customer, "cancelled", o.number); notify(d, customer.id, "n.status", { n: o.number }, `/account/orders/${o.id}`); }
       audit(d, actor, "ORDER_CANCELLED", o.number, "");
@@ -669,7 +827,7 @@ export const api = {
     const actor = requirePerm("keys");
     const db = store.db;
     const existing = new Set(db.licenseKeys.map((k) => k.key));
-    const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length >= 5 && !existing.has(s));
+    const lines = vKeyLines(raw).filter((s) => !existing.has(s)); // A22 — validated at the boundary
     store.mutate((d) => {
       for (const key of lines) { existing.add(key); d.licenseKeys.push({ id: uid("k"), productId, key, status: "UNUSED", orderId: null, reservedAt: null, deliveredAt: null, customerId: null }); }
       audit(d, actor, "KEYS_IMPORTED", db.products.find((p) => p.id === productId)?.slug ?? productId, `${lines.length} keys`);
