@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Static build: only the app shell URL is indexable. Product/category URLs become
+     real indexable paths (/, /products, /product/[slug], /category/[slug]) once the
+     storefront is served by the SSR production app — see DEPLOYMENT.md. -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://sherokey.com/</loc>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>

@@ -247,7 +247,7 @@ export function CheckoutPage() {
             <div className="grid sm:grid-cols-3 gap-3 mb-5" role="radiogroup" aria-label={t("co.method")}>
               {methods.map((m) => {
                 const active = m.method === method;
-                const reasonKey = m.reason === "currency" ? "co.providerCur" : m.reason === "down" ? "co.providerDown" : m.reason === "disabled" ? "co.providerOff" : null;
+                const reasonKey = m.reason === "currency" ? "co.providerCur" : m.reason === "down" ? "co.providerDown" : m.reason === "disabled" ? "co.providerOff" : m.reason === "notConfigured" ? "co.providerNotCfg" : null;
                 return (
                   <button key={m.method} role="radio" aria-checked={active} disabled={!!m.reason} onClick={() => setMethod(m.method)}
                     className={`p-4 rounded-xl border text-start transition flex items-center gap-3 min-h-16 ${active ? "border-volt-500 bg-volt-500/6" : "border-line hover:border-edge"} ${m.reason ? "opacity-40 cursor-not-allowed" : ""}`}>
@@ -317,7 +317,14 @@ export function CheckoutPage() {
             </div>
           </div>
           {failed && <p className="mt-4 text-[12.5px] font-bold text-danger-400 flex items-center gap-2"><IAlert size={14} /> {failed}</p>}
-          <Btn size="lg" className="w-full mt-5" onClick={pay} loading={busy} disabled={totals.lines.length === 0}>
+          {methods.every((m) => m.reason) ? (
+            <div className="mt-5 rounded-xl border border-danger-500/30 bg-danger-500/6 p-4 text-center">
+              <p className="text-[13px] font-extrabold text-danger-400">{t("co.payUnavailable")}</p>
+              <p className="text-[11.5px] text-dim font-semibold mt-1.5 leading-relaxed">{t("co.payUnavailableDesc")}</p>
+            </div>
+          ) : null}
+          <Btn size="lg" className="w-full mt-5" onClick={pay} loading={busy}
+            disabled={totals.lines.length === 0 || !!chosen.reason} aria-disabled={totals.lines.length === 0 || !!chosen.reason}>
             {method === "PAYPAL" ? <IPaypal size={17} /> : <ICard size={17} />} {t("co.pay", { amount: fmt(totals.totalMinor, totals.currency) })}
           </Btn>
           <p className="text-[11.5px] text-faint font-semibold mt-3.5 flex gap-2 leading-relaxed"><IShield size={13} className="shrink-0 mt-0.5 text-volt-400" /> {t("co.secureNote")}</p>

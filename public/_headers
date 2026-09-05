@@ -1,0 +1,11 @@
+# Netlify / Cloudflare Pages — real security headers applied at the edge.
+# CSP allows the storefront's font + image origins; tighten connect-src when the
+# production API (Stripe.js / PayPal SDK / server) is attached.
+/*
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(self)
+  Cross-Origin-Opener-Policy: same-origin
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https: data: blob:; connect-src 'self' https://api.stripe.com https://js.stripe.com https://www.paypal.com https://api-m.paypal.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; frame-src https://js.stripe.com https://hooks.stripe.com https://www.paypal.com; upgrade-insecure-requests

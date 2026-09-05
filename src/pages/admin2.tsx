@@ -630,7 +630,7 @@ import { store as storeResetHolder } from "../state/store";
 const storeReset = () => storeResetHolder.resetWorkspace();
 
 /* ================= PAYMENT PROVIDERS (req. 6) — OWNER only ================= */
-import { PROVIDER_META, providerCfg, type ProviderId, type PaymentRouting } from "../lib/payments";
+import { PROVIDER_META, providerCfg, providerStatus, type ProviderId, type PaymentRouting } from "../lib/payments";
 import { IStripe, IPaypal, ICard, IShield, ICoins } from "../components/icons";
 
 const PROV_ICON: Record<ProviderId, (p: { size?: number; className?: string }) => React.ReactNode> = {
@@ -657,6 +657,9 @@ export function AdminPayments() {
       <div>
         <h2 className="font-display text-lg font-extrabold flex items-center gap-2.5"><ICoins size={19} className="text-volt-400" /> {t("ad.payTitle")}</h2>
         <p className="text-[12.5px] text-dim mt-1 max-w-2xl leading-relaxed">{t("ad.payDesc")}</p>
+        <p className="mt-2 text-[11.5px] font-semibold text-ember-400/90 flex items-start gap-2 max-w-2xl leading-relaxed">
+          <IShield size={13} className="shrink-0 mt-0.5" /> {t("ad.payLiveNote")}
+        </p>
         {!isOwner && <p className="mt-2 text-[12px] font-bold text-ember-400 flex items-center gap-1.5"><IShield size={13} /> {t("ad.payOwnerOnly")}</p>}
       </div>
 
@@ -703,7 +706,19 @@ export function AdminPayments() {
                   <h3 className="font-display text-[13.5px] font-bold">{meta.label}</h3>
                   <p className="text-[11px] text-faint font-semibold font-mono" dir="ltr">{t("ad.payMerchant")}: {cfg.merchantMasked}</p>
                 </div>
-                <span className={`w-2 h-2 rounded-full ${cfg.enabled && cfg.operational ? "bg-volt-500" : "bg-danger-500"}`} />
+                {(() => {
+                  const st = providerStatus(cfg);
+                  return (
+                    <span className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[9.5px] font-extrabold tracking-wider ${
+                      st === "OPERATIONAL" ? "border-volt-500/40 bg-volt-500/10 text-volt-400"
+                        : st === "TEST_READY" ? "border-ember-500/40 bg-ember-500/10 text-ember-400"
+                        : "border-danger-500/40 bg-danger-500/10 text-danger-400"}`}
+                      title={t("ad.payLiveNote")}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${st === "OPERATIONAL" ? "bg-volt-500" : st === "TEST_READY" ? "bg-ember-500 anim-pulse-dot" : "bg-danger-500"}`} />
+                      {st === "OPERATIONAL" ? t("ad.payOp") : st === "TEST_READY" ? t("ad.payTestReady") : t("ad.payNotCfg")}
+                    </span>
+                  );
+                })()}
               </div>
               <div className="space-y-3.5">
                 <div className="flex items-center justify-between">

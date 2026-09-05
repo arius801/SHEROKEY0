@@ -57,14 +57,32 @@ export function providerCfg(s: Settings, id: ProviderId): ProviderCfg {
   return s.providers?.[id] ?? DEFAULT_PROVIDERS[id];
 }
 
+/**
+ * Truthful provider status.
+ *  - NOT_CONFIGURED: disabled, no currencies, or LIVE mode without server-side credentials.
+ *  - TEST_READY:     explicit sandbox/test mode (clearly labeled everywhere).
+ *  - OPERATIONAL:    LIVE + credentials present + connectivity verified.
+ * In this static workspace no real provider credentials can exist, therefore LIVE can
+ * never be reported OPERATIONAL here — that label is only reachable on the real server,
+ * where the check reads env secrets and performs a live provider probe.
+ */
+export type ProviderStatus = "NOT_CONFIGURED" | "TEST_READY" | "OPERATIONAL";
+export function providerStatus(cfg: ProviderCfg): ProviderStatus {
+  if (!cfg.enabled || cfg.currencies.length === 0) return "NOT_CONFIGURED";
+  if (cfg.mode === "LIVE") return "NOT_CONFIGURED"; // real credentials are server-side; impossible in this workspace
+  return cfg.operational ? "TEST_READY" : "NOT_CONFIGURED";
+}
+
 /** Checkout availability (req. 7): only configured + enabled + currency-supported + operational. */
 export function availableMethods(s: Settings, currency: Currency):
-  { method: PaymentMethod; provider: ProviderId; reason: null | "disabled" | "currency" | "down" }[] {
+  { method: PaymentMethod; provider: ProviderId; reason: null | "disabled" | "currency" | "down" | "notConfigured" }[] {
   const routes: PaymentMethod[] = ["CARD_INTL", "PAYPAL", "CARD_MIR"];
   return routes.map((method) => {
     const pid = s.routing?.[method] ?? DEFAULT_ROUTING[method];
     const cfg = providerCfg(s, pid);
-    if (!cfg.enabled) return { method, provider: pid, reason: "disabled" as const };
+    const status = providerStatus(cfg);
+    if (status === "NOT_CONFIGURED" && !cfg.enabled) return { method, provider: pid, reason: "disabled" as const };
+    if (status === "NOT_CONFIGURED") return { method, provider: pid, reason: "notConfigured" as const };
     if (!cfg.operational) return { method, provider: pid, reason: "down" as const };
     if (!cfg.currencies.includes(currency)) return { method, provider: pid, reason: "currency" as const };
     return { method, provider: pid, reason: null };
