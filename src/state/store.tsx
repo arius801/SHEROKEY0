@@ -322,8 +322,8 @@ export interface Totals {
   currency: Currency; fxRate: number; totalMinor: number;
 }
 
-export function computeTotals(items: CartItem[], couponCode: string | null, currency: Currency): Totals {
-  const db = store.db;
+export function computeTotals(items: CartItem[], couponCode: string | null, currency: Currency, dbOverride?: DB): Totals {
+  const db = dbOverride ?? store.db;
   const lines = items.flatMap((it) => {
     const product = db.products.find((p) => p.id === it.productId);
     return product && product.active ? [{ product, qty: it.qty, unitUsd: product.priceUsd, lineUsd: product.priceUsd * it.qty }] : [];

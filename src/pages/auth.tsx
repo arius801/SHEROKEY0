@@ -118,7 +118,7 @@ export function VerifySent() {
   // §36: the clickable token shortcut exists ONLY in explicitly TEST-mode workspaces;
   // production delivers the token exclusively inside the verification email.
   const sandbox = db.settings.providers?.STRIPE?.mode === "TEST";
-  const link = user.verifyToken && sandbox ? `#/verify?t=${user.verifyToken}` : null;
+  const link = user.verifyToken && sandbox ? `/verify-email?token=${user.verifyToken}` : null;
   return (
     <AuthShell title={t("au.verifyTitle")} sub={t("au.verifyDesc", { email: user.email })}>
       <div className="sk-card !bg-canvas p-5 text-center space-y-4">
@@ -147,7 +147,7 @@ export function Verify() {
   const nav = useNavigate();
   const [state, setState] = useState<"ok" | "err" | null>(null);
   useEffect(() => {
-    const token = params.get("t") ?? "";
+    const token = params.get("token") ?? params.get("t") ?? "";
     try { api.verifyEmail(token); setState("ok"); } catch { setState("err"); }
   }, [params]);
   return (

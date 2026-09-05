@@ -1,5 +1,7 @@
 import { Component, Suspense, lazy, useEffect, type ReactNode } from "react";
-import { HashRouter, Routes, Route, useLocation } from "react-router-dom";
+/* Real (history) routes for SEO (§23/§33). Static hosts use public/_redirects /
+   .htaccess / vercel.json SPA fallback; production runs behind server/api.ts. */
+import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
 import { store, useApp } from "./state/store";
 import { Shell } from "./components/layout";
 import { IKey, IAlert } from "./components/icons";
@@ -95,7 +97,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean
           </span>
           <h1 className="font-display text-xl font-extrabold mb-2">{tr(lang, "e.500t")}</h1>
           <p className="text-sm text-dim mb-6">{tr(lang, "e.500d")}</p>
-          <button onClick={() => { this.setState({ failed: false }); window.location.hash = "#/"; }}
+          <button onClick={() => { this.setState({ failed: false }); window.location.href = "/"; }}
             className="bg-volt-500 hover:bg-volt-400 text-[#062b1b] font-bold text-[13px] rounded-[10px] px-5 py-2.5 transition">
             {tr(lang, "c.back")}
           </button>
@@ -137,7 +139,7 @@ export default function App() {
 
   return (
     <ErrorBoundary>
-      <HashRouter>
+      <BrowserRouter>
         <ScrollToTop />
         <TitleSync />
         <Shell>
@@ -160,6 +162,7 @@ export default function App() {
                 <Route path="/auth/forgot" element={<Forgot />} />
                 <Route path="/auth/reset" element={<Reset />} />
                 <Route path="/verify" element={<Verify />} />
+                <Route path="/verify-email" element={<Verify />} />
                 <Route path="/support" element={<Support />} />
                 <Route path="/support/:id" element={<TicketThread />} />
                 <Route path="/faq" element={<Faq />} />
@@ -188,7 +191,7 @@ export default function App() {
             </Suspense>
           </ErrorBoundary>
         </Shell>
-      </HashRouter>
+      </BrowserRouter>
     </ErrorBoundary>
   );
 }

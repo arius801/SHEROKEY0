@@ -54,8 +54,8 @@ export function NotFound() {
       <h1 className="font-display text-2xl font-extrabold -mt-4 mb-3">{t("e.404t")}</h1>
       <p className="text-sm text-dim max-w-md mx-auto mb-8 leading-relaxed">{t("e.404d")}</p>
       <div className="flex justify-center gap-3">
-        <Btn onClick={() => (window.location.hash = "#/")}>{t("e.home")}</Btn>
-        <Btn variant="soft" onClick={() => (window.location.hash = "#/catalog")}>{t("nav.catalog")}</Btn>
+        <Btn onClick={() => (window.location.href = "/")}>{t("e.home")}</Btn>
+        <Btn variant="soft" onClick={() => (window.location.href = "/catalog")}>{t("nav.catalog")}</Btn>
       </div>
     </div>
   );
