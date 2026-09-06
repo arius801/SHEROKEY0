@@ -545,14 +545,24 @@ const routes: Record<string, Handler> = {
 import { inArray as sql_in } from "drizzle-orm";
 
 /* ================================================================ dispatcher */
+/* Both route keys and request paths are normalized to a single `:id` token so every
+ * param route matches regardless of param name or position (mid-path or trailing). */
+const normPath = (p: string) => p.replace(/\/:[^/]+/g, "/:id");
+const routeMap: Record<string, Handler> = Object.fromEntries(
+  Object.entries(routes).map(([k, h]) => {
+    const [m, ...rest] = k.split(" ");
+    return [`${m} ${normPath(rest.join(" "))}`, h] as const;
+  }),
+);
+
 export async function handle(ctx: Ctx): Promise<ApiResult> {
   const isWebhook = ctx.path.startsWith("/api/webhooks/");
   try {
     if (!isWebhook && ["POST", "PUT", "PATCH", "DELETE"].includes(ctx.method) && !csrfOk(ctx))
       return { status: 403, body: { error: "CSRF" }, headers: SECURITY_HEADERS };
     const user = isWebhook ? null : await resolveSession(ctx.headers.cookie);
-    const key = `${ctx.method} ${ctx.path.replace(/\/[0-9a-f-]{36}(?=\/)/g, "/:id")}`;
-    const handler = routes[key] ?? routes[`${ctx.method} ${ctx.path}`];
+    const key = `${ctx.method} ${ctx.path.replace(/\/[0-9a-fA-F-]{36}(?=\/|$)/g, "/:id")}`;
+    const handler = routeMap[key] ?? routeMap[`${ctx.method} ${ctx.path}`];
     if (!handler) return { status: 404, body: { error: "not_found" }, headers: SECURITY_HEADERS };
     const res = await handler(ctx, user);
     return { ...res, headers: { ...SECURITY_HEADERS, ...res.headers } };

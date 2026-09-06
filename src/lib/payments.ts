@@ -122,9 +122,17 @@ export async function signEvent(e: Omit<GatewayEvent, "signature" | "payload">):
   return { ...e, payload, signature: await hmacHex(GATEWAY_SECRET, payload) };
 }
 
-/** Real HMAC verification — an event whose signature fails never touches payment state. */
+/** Real HMAC verification — an event whose signature fails never touches payment state.
+ *  The signature is bound to the event's FIELDS: verification recomputes the canonical
+ *  payload from the parsed fields and rejects any event whose fields diverge from the
+ *  signed payload (tampered amount/order/type) as well as any bad signature. */
+function eventCanonical(e: GatewayEvent): string {
+  return canonical({ t: e.type, o: e.orderId, a: e.amountUsd, c: e.currency, p: e.providerPaymentId, id: e.providerEventId });
+}
 export async function verifyEventSignature(e: GatewayEvent): Promise<boolean> {
-  const expected = await hmacHex(GATEWAY_SECRET, e.payload);
+  const recomputed = eventCanonical(e);
+  if (!timingSafeEqual(recomputed, e.payload)) return false; // field tampering vs. signed payload
+  const expected = await hmacHex(GATEWAY_SECRET, recomputed);
   return timingSafeEqual(expected, e.signature);
 }
 
