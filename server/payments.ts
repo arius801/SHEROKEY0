@@ -299,8 +299,12 @@ async function ingestProviderEvent(opts: {
 }
 
 /* ================================================================ provider-side refunds */
-export async function providerRefund(provider: "STRIPE" | "PAYPAL" | "MIR_ACQUIRER", providerPaymentId: string | null, amountMinor: number, _currency: string): Promise<string | null> {
+export async function providerRefund(provider: "STRIPE" | "PAYPAL" | "MIR_ACQUIRER", providerPaymentId: string | null, amountMinor: number, currency: string): Promise<string | null> {
   if (!providerPaymentId) return null;
+  // Server-side refund guards (§3/§5): integer minor units, positive, real ISO currency — the
+  // refund is always issued in the ORIGINAL capture currency, never a client-supplied one.
+  if (!Number.isInteger(amountMinor) || amountMinor <= 0) throw new ApiError("REFUND_AMOUNT_INVALID", 422);
+  if (!/^[A-Z]{3}$/.test(currency)) throw new ApiError("REFUND_CURRENCY_INVALID", 422);
   if (provider === "STRIPE") {
     const r = await stripe().refunds.create({ payment_intent: providerPaymentId, amount: amountMinor });
     return r.id;
@@ -309,10 +313,13 @@ export async function providerRefund(provider: "STRIPE" | "PAYPAL" | "MIR_ACQUIR
     const token = await paypalToken();
     const res = await fetch(`${paypalBase()}/v2/payments/captures/${providerPaymentId}/refund`, {
       method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ amount: { value: (amountMinor / 100).toFixed(2), currency_code: "USD" } }),
+      body: JSON.stringify({ amount: { value: (amountMinor / 100).toFixed(2), currency_code: currency } }),
     });
     if (!res.ok) throw new ApiError("PAYPAL_REFUND_FAILED", 502);
-    return ((await res.json()) as { id: string }).id;
+    const body = (await res.json()) as { id?: string; status?: string };
+    if (!body.id || (body.status && body.status !== "COMPLETED" && body.status !== "PENDING"))
+      throw new ApiError("PAYPAL_REFUND_NOT_CONFIRMED", 502); // never record a refund the provider didn't confirm
+    return body.id;
   }
   const mir = await mirAdapter();
   if (!mir) throw new ApiError("PROVIDER_NOT_CONFIGURED — MIR", 503);

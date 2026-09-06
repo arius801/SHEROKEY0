@@ -313,9 +313,12 @@ export interface DB {
 
 export class ApiError extends Error {
   code: string;
-  vars?: Record<string, string>;
-  constructor(code: string, vars?: Record<string, string>) {
+  vars?: Record<string, string | number>;
+  /** HTTP status when the error came from the production server (client transport). */
+  status?: number;
+  constructor(code: string, vars?: Record<string, string | number> & { status?: number }) {
     super(code);
+    this.status = vars?.status;
     this.code = code;
     this.vars = vars;
   }

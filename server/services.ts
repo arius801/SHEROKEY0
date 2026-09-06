@@ -251,7 +251,10 @@ export async function refundOrder(orderId: string, staff: { id: string; name: st
 
     // provider-side refund (§25) — performed by the adapter; returns the provider refund id
     const { providerRefund } = await import("./payments");
-    const providerRefundId = payment ? await providerRefund(payment.provider, payment.providerPaymentId, o.totalUsdMinor, "USD") : null;
+    // refund the captured amount in the ORIGINAL capture currency recorded on the payment row
+    const providerRefundId = payment
+      ? await providerRefund(payment.provider, payment.providerPaymentId, Number(payment.amountMinor), payment.currency)
+      : null;
 
     await tx.insert(refunds).values({ paymentId: payment?.id ?? o.id, orderId, providerRefundId, amountMinor: o.totalMinor, currency: o.currency, reason, issuedBy: staff.id });
     // delivered keys are REVOKED — never recycled back into the sellable pool

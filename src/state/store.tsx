@@ -21,7 +21,44 @@ import {
 import { otpCode, sha256Hex, timingSafeEqual } from "../lib/crypto";
 
 const STORAGE_KEY = "sherokey.workspace.v1";
+const PREFS_KEY = "sherokey.prefs.v1"; // harmless UI preferences ONLY (theme/lang/currency)
 const DAY = 86400000;
+
+/* ------------------------------------------------------------------ */
+/* Runtime mode (§1): production builds are server-authoritative.      */
+/* The sandbox adapter is development-only and can never take over a   */
+/* production build — missing API configuration fails loudly instead.  */
+/* ------------------------------------------------------------------ */
+export const PROD_BUILD = import.meta.env.PROD;
+export const API_URL = ((import.meta.env.VITE_API_URL as string | undefined) ?? "").replace(/\/+$/, "");
+export const SERVER_MODE = PROD_BUILD; // PROD ⇒ server API is mandatory
+
+let csrfToken: string | null = null; // memory-only CSRF double-submit token from /api/bootstrap
+
+async function serverFetch<T>(path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
+  const res = await fetch(`${API_URL}${path}`, {
+    method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
+    credentials: "include", // HttpOnly session cookie
+    headers: {
+      ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+    },
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+  if (!res.ok) {
+    let code = "e.generic";
+    try { code = ((await res.json()) as { error?: string }).error ?? code; } catch { /* non-JSON */ }
+    throw new ApiError(code, { status: res.status });
+  }
+  return (await res.json()) as T;
+}
+
+function readPrefs(): { lang?: Lang; currency?: Currency; theme?: Theme } {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}"); } catch { return {}; }
+}
+function writePrefs(ui: { lang: Lang; currency: Currency; theme: Theme }) {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ lang: ui.lang, currency: ui.currency, theme: ui.theme })); } catch { /* ignore */ }
+}
 
 /* ------------------------------------------------------------------ */
 /* Store core                                                          */
@@ -97,9 +134,53 @@ class Store {
 
   persist() {
     if (!this._db) return;
+    if (SERVER_MODE) { writePrefs(this.ui); return; } // §1: server is authoritative — localStorage holds UI prefs only
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ db: this._db, ui: { lang: this.ui.lang, currency: this.ui.currency, theme: this.ui.theme } }));
     } catch { /* storage full/blocked — session continues in memory */ }
+  }
+
+  /** Hydrate the read-model from the production server (role-scoped, secrets excluded). */
+  private async bootstrap(): Promise<DB> {
+    const b = await serverFetch<{
+      csrfToken: string; settings: DB["settings"]; categories: DB["categories"]; products: DB["products"];
+      reviews: DB["reviews"]; user: (User & { emailVerified: boolean }) | null;
+      orders: (Order & { __keys?: string[] })[]; licenseKeys: DB["licenseKeys"]; notifications: DB["notifications"];
+      wishlist: DB["wishlist"]; tickets: DB["tickets"]; ticketMessages: DB["ticketMessages"];
+      coupons: DB["coupons"]; users: unknown[]; user: unknown; auditLogs: DB["auditLogs"]; emailLogs: DB["emailLogs"];
+      payments: DB["payments"]; paymentEvents: DB["paymentEvents"]; refunds: DB["refunds"]; carts: DB["carts"];
+    }>("/api/bootstrap");
+    csrfToken = b.csrfToken;
+    const orders: Order[] = b.orders.map(({ __keys, ...o }) => ({
+      ...o,
+      delivery: o.delivery ?? (__keys && __keys.length ? { keys: __keys, activationCode: null, account: null, downloadLink: null, notes: null } : null),
+    }));
+    return {
+      users: (b.users.length ? b.users : b.user ? [b.user] : []).map((raw): User => {
+        const u = raw as Record<string, unknown>;
+        const ca = u.createdAt;
+        return {
+          id: String(u.id), name: String(u.name), email: String(u.email),
+          role: (u.role ?? "CUSTOMER") as Role, lang: (u.lang ?? "en") as Lang, currency: (u.currency ?? "USD") as Currency,
+          verified: Boolean((u.emailVerified ?? u.verified) === true),
+          salt: "", passwordHash: "", verifyToken: null, verifyExpires: null, resetToken: null, resetExpires: null,
+          createdAt: ca instanceof Date ? ca.getTime() : Number(ca ?? Date.now()),
+          failedLogins: 0, lockedUntil: null,
+        };
+      }),
+      sessionUserId: b.user?.id ?? null, sessionToken: "server-session", sessionExpires: Date.now() + DAY,
+      categories: b.categories, products: b.products, licenseKeys: b.licenseKeys, orders,
+      payments: b.payments, paymentEvents: b.paymentEvents, refunds: b.refunds, coupons: b.coupons,
+      reviews: b.reviews, wishlist: b.wishlist, notifications: b.notifications,
+      tickets: b.tickets, ticketMessages: b.ticketMessages, auditLogs: b.auditLogs, emailLogs: b.emailLogs,
+      settings: b.settings, carts: b.carts, orderSeq: 0,
+    };
+  }
+
+  /** Re-sync the read-model after a mutation; the server stays the source of truth. */
+  async refresh() {
+    if (!SERVER_MODE) return;
+    try { this._db = await this.bootstrap(); this.emit(); } catch { /* transient — next action re-syncs */ }
   }
 
   /** Deterministic startup (A1): restore → validate shape → migrate → session restore → ready.
@@ -108,6 +189,32 @@ class Store {
     if (this.ui.ready) return Promise.resolve();
     if (this.initPromise) return this.initPromise;
     this.initPromise = (async () => {
+      /* PRODUCTION: server-authoritative hydration. No localStorage database, no silent
+       * sandbox fallback — missing API configuration fails loudly (§1). */
+      if (SERVER_MODE) {
+        const prefs = readPrefs();
+        if (prefs.lang) this.ui.lang = prefs.lang;
+        if (prefs.currency) this.ui.currency = prefs.currency;
+        if (prefs.theme) this.ui.theme = prefs.theme;
+        if (!API_URL) {
+          this.ui.ready = false;
+          this.ui.initError = "PRODUCTION_API_REQUIRED";
+          this.emit();
+          return;
+        }
+        try {
+          this._db = await this.bootstrap();
+          this.ui.ready = true;
+          this.ui.initError = null;
+          writePrefs(this.ui);
+        } catch {
+          this._db = null;
+          this.ui.ready = false;
+          this.ui.initError = "SERVER_UNREACHABLE";
+        }
+        this.emit();
+        return;
+      }
       let restored: DB | null = null;
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
@@ -146,6 +253,7 @@ class Store {
   retryInit = () => { this.initPromise = null; this.ui.initError = null; this.emit(); return this.init(); };
 
   resetWorkspace = async () => {
+    if (SERVER_MODE) throw new ApiError("e.forbidden"); // §1: production data is reset via ops tooling, never the browser
     try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
     this._db = await buildSeed();
     this.ui.ready = true;
@@ -497,10 +605,12 @@ function processPaymentEvent(db: DB, event: {
 }
 
 /* ------------------------------------------------------------------ */
-/* Public API                                                          */
+/* Public API — development sandbox implementation (browser repo).     */
+/* In SERVER_MODE the `serverApi` facade is exported instead and this  */
+/* object is unreachable in production builds (§1).                    */
 /* ------------------------------------------------------------------ */
 
-export const api = {
+const sandboxApi = {
   /* ---------- auth ---------- */
   async register(name: string, email: string, password: string) {
     const db = store.db;
@@ -1116,4 +1226,96 @@ export function productRating(db: DB, productId: string): { avg: number; count: 
   const rs = db.reviews.filter((r) => r.productId === productId && r.approved);
   if (rs.length === 0) return { avg: 0, count: 0 };
   return { avg: rs.reduce((s, r) => s + r.rating, 0) / rs.length, count: rs.length };
+}
+
+/* ------------------------------------------------------------------ */
+/* Production facade (§1): every action is a real server call. The     */
+/* browser never decides prices, roles, payment state or ownership —   */
+/* it renders the server's role-scoped snapshot and forwards intent.   */
+/* ------------------------------------------------------------------ */
+
+type SandboxApi = typeof sandboxApi;
+const serverPending = () => { throw new ApiError("e.serverPending"); };
+
+const serverRoutes: Record<string, (...args: never[]) => Promise<unknown> | unknown> = {
+  /* auth — HttpOnly session cookie set by the server on success */
+  register: async (name: string, email: string, password: string) => {
+    await serverFetch("/api/auth/register", { body: { name, email, password, confirm: password, lang: store.ui.lang, currency: store.ui.currency } });
+    await store.refresh();
+  },
+  login: async (email: string, password: string) => {
+    await serverFetch("/api/auth/login", { body: { email, password } });
+    await store.refresh();
+  },
+  logout: async () => { await serverFetch("/api/auth/logout", { body: {} }); await store.refresh(); },
+  requestReset: async (email: string) => { await serverFetch("/api/auth/forgot", { body: { email } }); },
+  resetPassword: async (token: string, password: string) => { await serverFetch("/api/auth/reset", { body: { token, password } }); },
+  verifyEmail: async (token: string) => {
+    const r = await serverFetch<{ ok: boolean }>("/api/auth/verify-email", { body: { token } });
+    if (!r.ok) throw new ApiError("e.notFound");
+    await store.refresh();
+  },
+  resendVerification: async () => { await serverFetch("/api/auth/resend-verification", { body: {} }); },
+  /* OTP — the code travels email→server only; never through this client (§6/§7) */
+  requestPaymentOtp: async () => { await serverFetch("/api/auth/otp/request", { body: {} }); },
+  verifyPaymentOtp: async (code: string) => {
+    const r = await serverFetch<{ ok: boolean }>("/api/auth/otp/verify", { body: { code } });
+    if (!r.ok) throw new ApiError("e.otpWrong");
+    await store.refresh();
+  },
+  updateProfile: async (patch: { name?: string }) => { await serverFetch("/api/account/profile", { body: patch }); await store.refresh(); },
+
+  /* cart — server-scoped to the session (§30) */
+  addToCart: async (productId: string, qty: number) => { await serverFetch("/api/cart/items", { body: { productId, qty } }); await store.refresh(); },
+  updateQty: async (productId: string, qty: number) => { await serverFetch("/api/cart/items", { body: { productId, qty } }); await store.refresh(); },
+  removeFromCart: async (productId: string) => { await serverFetch(`/api/cart/items/${productId}`, { method: "DELETE" }); await store.refresh(); },
+
+  /* checkout — server recalculates everything and returns the provider redirect (§10–§13).
+   * The browser NEVER marks anything PAID; that happens only via verified webhook/capture. */
+  placeOrder: async (couponCode: string | null, method: "STRIPE" | "PAYPAL" | "MIR") => {
+    const m = method === "MIR" ? "CARD_MIR" : method;
+    const r = await serverFetch<{ orderId: string; redirect?: string; paypalOrderId?: string }>("/api/checkout", { body: { couponCode, method: m } });
+    await store.refresh();
+    return r;
+  },
+  confirmPayment: async (orderId: string) => {
+    // No client-side confirmation exists in production. Re-sync and report the server state.
+    await store.refresh();
+    const o = store.db.orders.find((x) => x.id === orderId);
+    return { duplicate: false, status: o?.paymentStatus ?? "PENDING" };
+  },
+
+  /* engagement */
+  toggleWishlist: async (productId: string) => { await serverFetch(`/api/wishlist/${productId}`, { body: {} }); await store.refresh(); },
+  addReview: async (productId: string, rating: number, text: string) => { await serverFetch("/api/reviews", { body: { productId, rating, text } }); await store.refresh(); },
+  markRead: async (id: string) => { await serverFetch(`/api/notifications/${id}/read`, { body: {} }); await store.refresh(); },
+  markAllRead: async () => { await serverFetch("/api/notifications/read-all", { body: {} }); await store.refresh(); },
+  createTicket: async (subject: string, orderId: string | null, message: string) => {
+    const r = await serverFetch<{ id: string }>("/api/tickets", { body: { subject, orderId, message } });
+    await store.refresh();
+    return r.id;
+  },
+  replyTicket: async (id: string, text: string) => { await serverFetch(`/api/tickets/${id}/messages`, { body: { text } }); await store.refresh(); },
+  closeTicket: async (id: string) => { await serverFetch(`/api/tickets/${id}/close`, { body: {} }); await store.refresh(); },
+
+  /* admin — real RBAC-protected endpoints (§19); the server re-checks every call */
+  deliverManual: async (orderId: string, payload: DeliveryPayload) => { await serverFetch(`/api/admin/orders/${orderId}/deliver`, { body: payload }); await store.refresh(); },
+  refundOrder: async (orderId: string, reason: string) => { await serverFetch(`/api/admin/orders/${orderId}/refund`, { body: { reason } }); await store.refresh(); },
+};
+
+const serverApi = new Proxy({} as SandboxApi, {
+  get(_target, prop: string) {
+    if (prop in serverRoutes) return serverRoutes[prop];
+    return serverPending; // honest: action has no production endpoint yet — never a silent sandbox
+  },
+});
+
+export const api: SandboxApi = SERVER_MODE ? serverApi : sandboxApi;
+
+/* Surface server-side failures from fire-and-forget calls as visible toasts (§31). */
+if (SERVER_MODE && typeof window !== "undefined") {
+  window.addEventListener("unhandledrejection", (e) => {
+    const err = e.reason as ApiError | undefined;
+    if (err instanceof ApiError) store.toast(tr(store.ui.lang, err.code, err.vars), "err");
+  });
 }

@@ -269,7 +269,132 @@ const routes: Record<string, Handler> = {
   "POST /api/webhooks/stripe": async (ctx) => ({ status: 200, body: await handleStripeWebhook(ctx.body, ctx.headers["stripe-signature"] ?? "") }),
   "POST /api/webhooks/paypal": async (ctx) => ({ status: 200, body: await handlePayPalWebhook(ctx.headers, ctx.body) }),
   "POST /api/webhooks/mir": async (ctx) => ({ status: 200, body: await handleMirWebhook(ctx.body, ctx.headers["x-mir-signature"] ?? "") }),
+
+  /* ---- bootstrap: role-scoped snapshot that hydrates the storefront (§1 frontend→API).
+     Secrets (password hashes, keys of other customers, provider credentials) NEVER leave
+     the server; provider status is computed from real configuration, never faked. ---- */
+  "GET /api/bootstrap": async (ctx, user) => {
+    const d = requireDb();
+    const { categories, orderItems, orderStatusHistory, notifications, wishlistItems, supportTickets, supportTicketMessages, emailLogs, auditLogs, reviews } = await import("./db");
+    const { randomBytes } = await import("node:crypto");
+    const csrfToken = randomBytes(24).toString("hex"); // double-submit pair (readable cookie + header)
+
+    const [cats, prods, apprReviews] = await Promise.all([
+      d.select().from(categories),
+      d.select().from(products),
+      d.select().from(reviews).where(eq(reviews.approved, true)),
+    ]);
+    const active = prods.filter((p) => p.active);
+    const unusedCounts = new Map<string, number>();
+    if (active.some((p) => p.deliveryMethod === "AUTO")) {
+      const { sql } = await import("drizzle-orm");
+      const rows = await d.select({ pid: licenseKeys.productId, n: sql<number>`count(*)::int` })
+        .from(licenseKeys).where(sql`${licenseKeys.status} = 'UNUSED'`).groupBy(licenseKeys.productId);
+      for (const r of rows) unusedCounts.set(r.pid, Number(r.n));
+    }
+    const productsOut = active.map((p) => ({
+      ...p, priceUsd: Number(p.priceMinor), compareAtUsd: p.compareAtMinor != null ? Number(p.compareAtMinor) : null,
+      stock: p.deliveryMethod === "AUTO" ? (unusedCounts.get(p.id) ?? 0) : p.stock,
+    }));
+
+    const settingsOut = {
+      storeName: await getSetting("storeName", "SHEROKEY"),
+      description: await getSetting("description", ""),
+      supportEmail: await getSetting("supportEmail", "support@sherokey.com"),
+      contactEmail: await getSetting("contactEmail", "hello@sherokey.com"),
+      langs: ["en", "ar", "ru", "fr"], currencies: ["USD", "EUR", "SAR", "RUB"],
+      defaultLang: "en", defaultCurrency: "USD",
+      fx: await getSetting("fx", { USD: 1, EUR: 0.92, SAR: 3.75, RUB: 96 }),
+      taxRatePct: await getSetting("taxRatePct", 0),
+      maintenanceMode: await getSetting("maintenanceMode", false),
+      emailProvider: await getSetting("emailProvider", "RESEND"),
+      emailFrom: await getSetting("emailFrom", "SHEROKEY <no-reply@sherokey.com>"),
+      requireReviewApproval: true,
+      stripeEnabled: stripeHealth() !== "NOT_CONFIGURED",
+      paypalEnabled: paypalHealth() !== "NOT_CONFIGURED",
+      // honest status (§20): computed from real server-side configuration, secrets excluded
+      providerHealth: { STRIPE: stripeHealth(), PAYPAL: paypalHealth(), MIR_ACQUIRER: mirHealth() },
+    };
+
+    const body: Record<string, unknown> = {
+      csrfToken, settings: settingsOut, categories: cats, products: productsOut,
+      reviews: apprReviews.map((r) => ({ ...r, customerName: "Customer", text: r.text, approved: true })),
+      user: user ? { id: user.id, name: user.name, email: user.email, role: user.role, emailVerified: user.emailVerified, lang: user.lang, currency: user.currency } : null,
+      orders: [], licenseKeys: [], notifications: [], wishlist: [], tickets: [], ticketMessages: [],
+      coupons: [], users: [], auditLogs: [], emailLogs: [], payments: [], paymentEvents: [], refunds: [], carts: [],
+    };
+
+    if (user) {
+      const [myOrders, myItems, myHistory, myKeys, myNotifs, myWish, myTickets, myMsgs, myCarts] = await Promise.all([
+        d.select().from(orders).where(eq(orders.customerId, user.id)),
+        d.select().from(orderItems),
+        d.select().from(orderStatusHistory),
+        d.select().from(licenseKeys).where(eq(licenseKeys.customerId, user.id)),
+        d.select().from(notifications).where(eq(notifications.userId, user.id)),
+        d.select().from(wishlistItems).where(eq(wishlistItems.userId, user.id)),
+        d.select().from(supportTickets).where(eq(supportTickets.customerId, user.id)),
+        d.select().from(supportTicketMessages),
+        d.select().from((await import("./db")).carts).where(eq((await import("./db")).carts.ownerId, user.id)),
+      ]);
+      const mine = new Set(myOrders.map((o) => o.id));
+      body.orders = myOrders.map((o) => ({
+        id: o.id, number: o.number, customerId: o.customerId, customerName: o.customerName, email: o.email,
+        items: myItems.filter((i) => i.orderId === o.id).map((i) => ({
+          productId: i.productId, name: i.nameSnapshot, image: i.imageSnapshot, qty: i.qty,
+          unitUsd: Number(i.unitUsdMinor), lineTotalUsd: Number(i.lineUsdMinor), deliveryMethod: i.deliveryMethod,
+        })),
+        couponCode: o.couponCode, discountUsd: Math.round(Number(o.discountMinor) / Number(o.fxRate)), taxUsd: Math.round(Number(o.taxMinor) / Number(o.fxRate)),
+        totalUsd: Number(o.totalUsdMinor), currency: o.currency, fxRate: o.fxRate, totalMinor: Number(o.totalMinor),
+        paymentMethod: o.payMethod === "PAYPAL" ? "PAYPAL" : o.payMethod === "CARD_MIR" ? "MIR" : "STRIPE",
+        paymentId: null, paymentStatus: o.paymentStatus, fulfillmentStatus: o.fulfillmentStatus,
+        delivery: o.delivery, deliveredBy: o.deliveredBy,
+        history: myHistory.filter((h) => h.orderId === o.id).map((h) => ({ at: h.at.getTime(), state: h.state, by: h.actor })),
+        createdAt: o.createdAt.getTime(), paidAt: o.paidAt?.getTime() ?? null, deliveredAt: o.deliveredAt?.getTime() ?? null,
+        // keys ONLY for this customer's paid orders — never inventory-wide (§16/§21)
+        __keys: (o.paymentStatus === "PAID" || o.paymentStatus === "REFUNDED")
+          ? myKeys.filter((k) => k.orderId === o.id && (k.status === "DELIVERED" || k.status === "USED")).map((k) => k.key) : [],
+      }));
+      body.notifications = myNotifs; body.wishlist = myWish.map((w) => ({ userId: w.userId, productId: w.productId }));
+      body.tickets = myTickets; body.ticketMessages = myMsgs.filter((m) => mine.has(m.ticketId) || myTickets.some((t) => t.id === m.ticketId));
+      body.carts = myCarts.map((c) => ({ id: c.id, ownerId: c.ownerId, items: [] }));
+      const { cartItems } = await import("./db");
+      const lines = myCarts.length ? await d.select().from(cartItems).where(sql_in(cartItems.cartId, myCarts.map((c) => c.id))) : [];
+      (body.carts as { id: string; ownerId: string | null; items: { productId: string; qty: number }[] }[]).forEach((c) => {
+        c.items = lines.filter((l) => l.cartId === c.id).map((l) => ({ productId: l.productId, qty: l.qty }));
+      });
+    }
+
+    if (user && ["OWNER", "ADMIN", "SUPPORT"].includes(user.role)) {
+      const { payments, paymentEvents, refunds } = await import("./db");
+      const [allOrders, allKeys, allCoupons, allUsers, allAudit, allEmails, allPayments, allEvents, allRefunds, allTickets, allMsgs] = await Promise.all([
+        d.select().from(orders), d.select().from(licenseKeys), d.select().from(coupons),
+        d.select({ id: users.id, name: users.name, email: users.email, role: users.role, lang: users.lang, currency: users.currency, emailVerified: users.emailVerified, createdAt: users.createdAt }).from(users), // passwordHash excluded
+        d.select().from(auditLogs), d.select().from(emailLogs), d.select().from(payments), d.select().from(paymentEvents), d.select().from(refunds),
+        d.select().from(supportTickets), d.select().from(supportTicketMessages),
+      ]);
+      body.orders = allOrders.map((o) => ({
+        id: o.id, number: o.number, customerId: o.customerId, customerName: o.customerName, email: o.email,
+        items: [], couponCode: o.couponCode, discountUsd: 0, taxUsd: 0, totalUsd: Number(o.totalUsdMinor),
+        currency: o.currency, fxRate: o.fxRate, totalMinor: Number(o.totalMinor),
+        paymentMethod: o.payMethod === "PAYPAL" ? "PAYPAL" : o.payMethod === "CARD_MIR" ? "MIR" : "STRIPE",
+        paymentId: null, paymentStatus: o.paymentStatus, fulfillmentStatus: o.fulfillmentStatus,
+        delivery: o.delivery, deliveredBy: o.deliveredBy,
+        history: [], createdAt: o.createdAt.getTime(), paidAt: o.paidAt?.getTime() ?? null, deliveredAt: o.deliveredAt?.getTime() ?? null, __keys: [],
+      }));
+      body.licenseKeys = allKeys; body.coupons = allCoupons; body.users = allUsers;
+      body.auditLogs = allAudit.map((a) => ({ id: String(a.id), actorId: a.actorId ?? "system", actorName: a.actorName, action: a.action, target: a.target, meta: a.meta, at: a.at.getTime() }));
+      body.emailLogs = allEmails; body.payments = allPayments; body.paymentEvents = allEvents.map((e) => ({ eventId: e.eventId, provider: e.provider, type: e.eventType, orderId: e.orderId, signatureValid: true, payloadHash: e.payloadHash, processed: e.processed, receivedAt: e.receivedAt.getTime() }));
+      body.refunds = allRefunds; body.tickets = allTickets; body.ticketMessages = allMsgs;
+    }
+
+    return {
+      status: 200, body,
+      headers: { "Set-Cookie": `shk_csrf=${csrfToken}; Path=/; SameSite=Lax${process.env.NODE_ENV === "production" ? "; Secure" : ""}` },
+    };
+  },
 };
+
+import { inArray as sql_in } from "drizzle-orm";
 
 /* ================================================================ dispatcher */
 export async function handle(ctx: Ctx): Promise<ApiResult> {

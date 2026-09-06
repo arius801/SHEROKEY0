@@ -2,7 +2,7 @@ import { Component, Suspense, lazy, useEffect, type ReactNode } from "react";
 /* Real (history) routes for SEO (§23/§33). Static hosts use public/_redirects /
    .htaccess / vercel.json SPA fallback; production runs behind server/api.ts. */
 import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
-import { store, useApp } from "./state/store";
+import { store, useApp, SERVER_MODE } from "./state/store";
 import { Shell } from "./components/layout";
 import { IKey, IAlert } from "./components/icons";
 import { tr } from "./lib/i18n";
@@ -67,16 +67,22 @@ function InitError() {
           <IAlert size={24} />
         </span>
         <h1 className="font-display text-lg font-extrabold mb-2">SHEROKEY</h1>
-        <p className="text-sm text-dim leading-relaxed mb-6">{t("init.failed")}</p>
+        <p className="text-sm text-dim leading-relaxed mb-6">
+          {store.ui.initError === "PRODUCTION_API_REQUIRED" ? t("init.apiRequired")
+            : store.ui.initError === "SERVER_UNREACHABLE" ? t("init.unreachable")
+            : t("init.failed")}
+        </p>
         <div className="flex gap-2.5 justify-center">
           <button onClick={() => { void store.retryInit(); }}
             className="bg-volt-500 hover:bg-volt-400 text-[#062b1b] font-bold text-[13px] rounded-[10px] px-5 py-2.5 transition">
             {t("init.retry")}
           </button>
-          <button onClick={() => { void store.resetWorkspace(); }}
-            className="border border-line hover:border-edge text-dim hover:text-fog font-bold text-[13px] rounded-[10px] px-5 py-2.5 transition">
-            {t("init.reset")}
-          </button>
+          {!SERVER_MODE && (
+            <button onClick={() => { void store.resetWorkspace(); }}
+              className="border border-line hover:border-edge text-dim hover:text-fog font-bold text-[13px] rounded-[10px] px-5 py-2.5 transition">
+              {t("init.reset")}
+            </button>
+          )}
         </div>
       </div>
     </div>

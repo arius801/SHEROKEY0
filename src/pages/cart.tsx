@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useApp, api, computeTotals, orderStateKey, currentCartItems } from "../state/store";
+import type { Order } from "../lib/types";
 import { availableMethods, providerCfg, type PaymentMethod as PayMethod } from "../lib/payments";
 import { Btn, Empty, Field, Input, KeyField, OrderBadge, Qty, Badge, toast } from "../components/ui";
 import { ICart, ITag, IBolt, IWrench, ICheck, IShield, IStripe, IPaypal, ICard, IArrowR, IAlert, IMail, IClock } from "../components/icons";
@@ -185,10 +186,23 @@ export function CheckoutPage() {
       const coupon = code.trim() || sessionStorage.getItem(COUPON_KEY);
       let orderId = pendingOrderId;
       if (!orderId) {
-        const order = api.placeOrder(coupon, orderMethodFor(method)); // server reprices everything (A24)
-        orderId = order.id;
+        // server reprices everything (A24); in SERVER_MODE this is a real API call that
+        // returns the provider's hosted-checkout redirect (§10–§13)
+        const res = api.placeOrder(coupon, orderMethodFor(method)) as
+          | Order | { orderId: string; redirect?: string; paypalOrderId?: string };
+        const redirect = (res as { redirect?: string }).redirect;
+        if (redirect) {
+          // real Stripe Checkout / PayPal approval / MIR acquirer page — payment confirmation
+          // comes back ONLY through the verified server webhook, never this browser tab
+          sessionStorage.removeItem(COUPON_KEY);
+          setStage(null);
+          window.location.assign(redirect);
+          return;
+        }
+        orderId = (res as Order).id ?? (res as { orderId: string }).orderId;
         setPendingOrderId(orderId);
       }
+      if (!orderId) return;
       setStage("processing");
       await api.confirmPayment(orderId, isCard ? card.num : undefined);
       sessionStorage.removeItem(COUPON_KEY);
