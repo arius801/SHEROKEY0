@@ -9,10 +9,10 @@ import { z } from "zod";
 import type { ServerResponse } from "node:http";
 import { resolveSession, revokeSession, SESSION_COOKIE, serializeSessionCookie, audit, type SessionUser } from "./lib/auth";
 import { RateLimited } from "./lib/infra";
-import { ApiError, accounts, createOrder, manualDeliver, refundOrder, priceCart } from "./services";
+import { ApiError, accounts, createOrder, manualDeliver, refundOrder, completeOrder, cancelOrder, priceCart } from "./services";
 import { createStripeCheckout, handleStripeWebhook, createPayPalOrder, capturePayPalOrder, handlePayPalWebhook, handleMirWebhook, mirAdapter, stripeHealth, paypalHealth, mirHealth } from "./payments";
-import { requireDb, users, products, licenseKeys, orders, coupons } from "./db";
-import { eq } from "drizzle-orm";
+import { requireDb, users, products, licenseKeys, orders, coupons, wishlistItems, reviews, notifications, supportTickets, supportTicketMessages, carts, cartItems } from "./db";
+import { and, eq } from "drizzle-orm";
 import { getSetting } from "./lib/infra";
 import type { Currency } from "../src/lib/types";
 
@@ -243,6 +243,142 @@ const routes: Record<string, Handler> = {
       .where(eq(licenseKeys.customerId, user.id));
     return { status: 200, body: rows.filter((_, i) => true).map((r) => r) };
   },
+  "POST /api/account/profile": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const { name, lang, currency } = z.object({ name: z.string().min(2).max(120).optional(), lang: z.enum(["en","ar","ru","fr"]).optional(), currency: z.enum(["USD","EUR","SAR","RUB"]).optional() }).parse(JSON.parse(ctx.body));
+    const d = requireDb();
+    const patch: Record<string, unknown> = {};
+    if (name !== undefined) patch.name = name;
+    if (lang !== undefined) patch.lang = lang;
+    if (currency !== undefined) patch.currency = currency;
+    patch.updatedAt = new Date();
+    if (Object.keys(patch).length > 1) await d.update(users).set(patch).where(eq(users.id, user.id));
+    return { status: 200, body: { ok: true } };
+  },
+
+  /* ---- cart retrieve/remove (server-scoped, §30) ---- */
+  "GET /api/cart": async (_ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const d = requireDb();
+    const cart = (await d.select().from(carts).where(eq(carts.ownerId, user.id)).limit(1))[0];
+    if (!cart) return { status: 200, body: { items: [] } };
+    const items = await d.select({ productId: cartItems.productId, qty: cartItems.qty }).from(cartItems).where(eq(cartItems.cartId, cart.id));
+    return { status: 200, body: { items } };
+  },
+  "DELETE /api/cart/items/:productId": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const productId = ctx.path.split("/").pop() ?? "";
+    const d = requireDb();
+    const cart = (await d.select().from(carts).where(eq(carts.ownerId, user.id)).limit(1))[0];
+    if (cart) await d.delete(cartItems).where(and(eq(cartItems.cartId, cart.id), eq(cartItems.productId, productId)));
+    return { status: 200, body: { ok: true } };
+  },
+
+  /* ---- wishlist (customer-owned, §24) ---- */
+  "GET /api/wishlist": async (_ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const d = requireDb();
+    const rows = await d.select({ productId: wishlistItems.productId }).from(wishlistItems).where(eq(wishlistItems.userId, user.id));
+    return { status: 200, body: rows };
+  },
+  "POST /api/wishlist/:productId": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const productId = ctx.path.split("/").pop() ?? "";
+    const d = requireDb();
+    const existing = (await d.select().from(wishlistItems).where(and(eq(wishlistItems.userId, user.id), eq(wishlistItems.productId, productId))).limit(1))[0];
+    if (existing) await d.delete(wishlistItems).where(eq(wishlistItems.id, existing.id));
+    else await d.insert(wishlistItems).values({ userId: user.id, productId });
+    return { status: 200, body: { ok: true, inWishlist: !existing } };
+  },
+
+  /* ---- reviews (verified-purchase enforced server-side, §23) ---- */
+  "POST /api/reviews": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const { productId, rating, text } = z.object({ productId: z.string().uuid(), rating: z.number().int().min(1).max(5), text: z.string().min(5).max(2000) }).parse(JSON.parse(ctx.body));
+    const d = requireDb();
+    // only a customer with a PAID order containing this product may review (verified purchase)
+    const bought = await d.select().from(orders)
+      .innerJoin(orderItems, eq(orderItems.orderId, orders.id))
+      .where(and(eq(orders.customerId, user.id), eq(orderItems.productId, productId), eq(orders.paymentStatus, "PAID")));
+    if (bought.length === 0) throw new ApiError("e.buyReview", 403);
+    await d.insert(reviews).values({ productId, customerId: user.id, rating, text, verifiedPurchase: true, approved: false })
+      .onConflictDoNothing(); // one review per product per customer (§23)
+    return { status: 201, body: { ok: true } };
+  },
+
+  /* ---- notifications (customer-owned, §25) ---- */
+  "GET /api/notifications": async (_ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const d = requireDb();
+    const rows = await d.select().from(notifications).where(eq(notifications.userId, user.id));
+    return { status: 200, body: rows };
+  },
+  "POST /api/notifications/:id/read": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const id = ctx.path.split("/")[3];
+    const d = requireDb();
+    await d.update(notifications).set({ read: true }).where(and(eq(notifications.id, id), eq(notifications.userId, user.id))); // IDOR: own only
+    return { status: 200, body: { ok: true } };
+  },
+  "POST /api/notifications/read-all": async (_ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const d = requireDb();
+    await d.update(notifications).set({ read: true }).where(eq(notifications.userId, user.id));
+    return { status: 200, body: { ok: true } };
+  },
+
+  /* ---- support tickets (customer creates; staff reply/close, §26) ---- */
+  "GET /api/tickets": async (_ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const d = requireDb();
+    const rows = user.role === "CUSTOMER"
+      ? await d.select().from(supportTickets).where(eq(supportTickets.customerId, user.id))
+      : await d.select().from(supportTickets); // staff see all
+    return { status: 200, body: rows };
+  },
+  "POST /api/tickets": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const { subject, orderId, message } = z.object({ subject: z.string().min(4).max(160), orderId: z.string().uuid().nullable(), message: z.string().min(10).max(4000) }).parse(JSON.parse(ctx.body));
+    const d = requireDb();
+    if (orderId) { const own = await d.select().from(orders).where(and(eq(orders.id, orderId), eq(orders.customerId, user.id))); if (own.length === 0) throw new ApiError("e.forbidden", 403); } // IDOR
+    const t = (await d.insert(supportTickets).values({ customerId: user.id, orderId, subject }).returning())[0];
+    await d.insert(supportTicketMessages).values({ ticketId: t.id, authorId: user.id, staff: false, text: message });
+    return { status: 201, body: { id: t.id } };
+  },
+  "POST /api/tickets/:id/messages": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const id = ctx.path.split("/")[3];
+    const { text } = z.object({ text: z.string().min(2).max(4000) }).parse(JSON.parse(ctx.body));
+    const d = requireDb();
+    const t = (await d.select().from(supportTickets).where(eq(supportTickets.id, id)).limit(1))[0];
+    if (!t) throw new ApiError("e.notFound", 404);
+    const staff = user.role !== "CUSTOMER";
+    if (!staff && t.customerId !== user.id) throw new ApiError("e.forbidden", 403); // IDOR: own ticket only
+    await d.insert(supportTicketMessages).values({ ticketId: id, authorId: user.id, staff, text });
+    await d.update(supportTickets).set({ updatedAt: new Date() }).where(eq(supportTickets.id, id));
+    return { status: 201, body: { ok: true } };
+  },
+  "POST /api/tickets/:id/close": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const id = ctx.path.split("/")[3];
+    const d = requireDb();
+    const t = (await d.select().from(supportTickets).where(eq(supportTickets.id, id)).limit(1))[0];
+    if (!t) throw new ApiError("e.notFound", 404);
+    if (user.role === "CUSTOMER" && t.customerId !== user.id) throw new ApiError("e.forbidden", 403); // IDOR
+    await d.update(supportTickets).set({ status: "CLOSED", updatedAt: new Date() }).where(eq(supportTickets.id, id));
+    return { status: 200, body: { ok: true } };
+  },
+
+  /* ---- payment status (never client-decided; read from verified server state, §3) ---- */
+  "GET /api/payment/status/:orderId": async (ctx, user) => {
+    if (!user) throw new ApiError("e.session", 401);
+    const orderId = ctx.path.split("/").pop() ?? "";
+    const d = requireDb();
+    const o = (await d.select({ id: orders.id, paymentStatus: orders.paymentStatus, fulfillmentStatus: orders.fulfillmentStatus }).from(orders)
+      .where(and(eq(orders.id, orderId), eq(orders.customerId, user.id))).limit(1))[0]; // IDOR: own order only
+    if (!o) throw new ApiError("e.notFound", 404);
+    return { status: 200, body: { paymentStatus: o.paymentStatus, fulfillmentStatus: o.fulfillmentStatus } };
+  },
 
   /* ---- admin (§19/§23 — server-side RBAC on every route) ---- */
   "POST /api/admin/orders/:id/deliver": async (ctx, user) => {
@@ -257,6 +393,18 @@ const routes: Record<string, Handler> = {
     const id = ctx.path.split("/")[4];
     const { reason } = parse(S.refund, ctx.body);
     const r = await refundOrder(id, actor, reason, ctx.ip);
+    return { status: 200, body: r };
+  },
+  "POST /api/admin/orders/:id/complete": async (ctx, user) => {
+    const actor = requirePerm(user, "adminOrders");
+    const id = ctx.path.split("/")[4];
+    const r = await completeOrder(id, actor, ctx.ip);
+    return { status: 200, body: r };
+  },
+  "POST /api/admin/orders/:id/cancel": async (ctx, user) => {
+    const actor = requirePerm(user, "cancel");
+    const id = ctx.path.split("/")[4];
+    const r = await cancelOrder(id, actor, ctx.ip);
     return { status: 200, body: r };
   },
   "GET /api/admin/providers": async (_ctx, user) => {

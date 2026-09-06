@@ -288,4 +288,36 @@ export async function manualDeliver(orderId: string, staff: { id: string; name: 
   });
 }
 
+/* ================================================================ admin lifecycle transitions (§16) — server-enforced state machine */
+export async function completeOrder(orderId: string, staff: { id: string; name: string; role: string }, ip?: string): Promise<{ ok: boolean }> {
+  const d = requireDb();
+  return d.transaction(async (tx) => {
+    const o = (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
+    if (!o) throw new ApiError("e.notFound", 404);
+    if (o.fulfillmentStatus !== "DELIVERED") throw new ApiError("e.transition", 409); // only DELIVERED → COMPLETED
+    await tx.update(orders).set({ fulfillmentStatus: "COMPLETED", updatedAt: new Date() }).where(eq(orders.id, orderId));
+    await tx.insert(orderStatusHistory).values({ orderId, state: "COMPLETED", actor: `admin:${staff.name}` });
+    await audit(staff.id, staff.name, "ORDER_COMPLETED", o.number, "", ip);
+    return { ok: true };
+  });
+}
+
+export async function cancelOrder(orderId: string, staff: { id: string; name: string; role: string }, ip?: string): Promise<{ ok: boolean }> {
+  const d = requireDb();
+  return d.transaction(async (tx) => {
+    const o = (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
+    if (!o) throw new ApiError("e.notFound", 404);
+    if (o.paymentStatus === "REFUNDED" || o.fulfillmentStatus === "CANCELLED") throw new ApiError("e.transition", 409); // terminal — no re-cancel
+    // release any reserved (undelivered) keys back to the pool
+    await tx.update(licenseKeys).set({ status: "UNUSED", orderId: null, reservedAt: null })
+      .where(and(eq(licenseKeys.orderId, orderId), eq(licenseKeys.status, "RESERVED")));
+    const wasPaid = o.paymentStatus === "PAID";
+    await tx.update(orders).set({ fulfillmentStatus: "CANCELLED", paymentStatus: wasPaid ? o.paymentStatus : "CANCELLED", updatedAt: new Date() }).where(eq(orders.id, orderId));
+    if (!wasPaid) await tx.update(payments).set({ status: "CANCELLED", updatedAt: new Date() }).where(eq(payments.orderId, orderId));
+    await tx.insert(orderStatusHistory).values({ orderId, state: "CANCELLED", actor: `admin:${staff.name}` });
+    await audit(staff.id, staff.name, "ORDER_CANCELLED", o.number, wasPaid ? "paid order cancelled (refund separately)" : "", ip);
+    return { ok: true };
+  });
+}
+
 export const accounts = { register, login, issueEmailVerification, consumeEmailVerification, issueOtp, verifyOtp, OTP_MAX_ATTEMPTS, issuePasswordReset, consumePasswordReset, revokeAllSessions };

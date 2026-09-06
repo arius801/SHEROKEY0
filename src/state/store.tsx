@@ -144,10 +144,10 @@ class Store {
   private async bootstrap(): Promise<DB> {
     const b = await serverFetch<{
       csrfToken: string; settings: DB["settings"]; categories: DB["categories"]; products: DB["products"];
-      reviews: DB["reviews"]; user: (User & { emailVerified: boolean }) | null;
+      reviews: DB["reviews"]; user: { id: string } | null;
       orders: (Order & { __keys?: string[] })[]; licenseKeys: DB["licenseKeys"]; notifications: DB["notifications"];
       wishlist: DB["wishlist"]; tickets: DB["tickets"]; ticketMessages: DB["ticketMessages"];
-      coupons: DB["coupons"]; users: unknown[]; user: unknown; auditLogs: DB["auditLogs"]; emailLogs: DB["emailLogs"];
+      coupons: DB["coupons"]; users: unknown[]; auditLogs: DB["auditLogs"]; emailLogs: DB["emailLogs"];
       payments: DB["payments"]; paymentEvents: DB["paymentEvents"]; refunds: DB["refunds"]; carts: DB["carts"];
     }>("/api/bootstrap");
     csrfToken = b.csrfToken;
@@ -1301,6 +1301,8 @@ const serverRoutes: Record<string, (...args: never[]) => Promise<unknown> | unkn
   /* admin — real RBAC-protected endpoints (§19); the server re-checks every call */
   deliverManual: async (orderId: string, payload: DeliveryPayload) => { await serverFetch(`/api/admin/orders/${orderId}/deliver`, { body: payload }); await store.refresh(); },
   refundOrder: async (orderId: string, reason: string) => { await serverFetch(`/api/admin/orders/${orderId}/refund`, { body: { reason } }); await store.refresh(); },
+  completeOrder: async (orderId: string) => { await serverFetch(`/api/admin/orders/${orderId}/complete`, { body: {} }); await store.refresh(); },
+  cancelOrder: async (orderId: string) => { await serverFetch(`/api/admin/orders/${orderId}/cancel`, { body: {} }); await store.refresh(); },
 };
 
 const serverApi = new Proxy({} as SandboxApi, {

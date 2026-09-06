@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useApp, api, computeTotals, orderStateKey, currentCartItems } from "../state/store";
+import { useApp, api, computeTotals, orderStateKey, currentCartItems, SERVER_MODE, store } from "../state/store";
 import type { Order } from "../lib/types";
 import { availableMethods, providerCfg, type PaymentMethod as PayMethod } from "../lib/payments";
 import { Btn, Empty, Field, Input, KeyField, OrderBadge, Qty, Badge, toast } from "../components/ui";
@@ -355,6 +355,16 @@ export function OrderResult() {
   const { db, t, user, fmt } = useApp();
   const nav = useNavigate();
   const o = db.orders.find((x) => x.id === id);
+
+  /* Production: poll the server until the verified webhook flips payment state (§3/§29).
+     The browser never decides PAID — it only re-reads the authoritative server status. */
+  useEffect(() => {
+    if (!SERVER_MODE || !id) return;
+    const done = o && ["PAID", "FAILED", "REFUNDED", "CANCELLED"].includes(o.paymentStatus);
+    if (done) return;
+    const iv = window.setInterval(() => { void store.refresh(); }, 3000);
+    return () => window.clearInterval(iv);
+  }, [id, o?.paymentStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!o || (user && o.customerId !== user.id && user.role === "CUSTOMER"))
     return <div className="max-w-2xl mx-auto px-4 py-20"><Empty icon={<IAlert size={22} />} title={t("e.404t")} desc={t("e.404d")} action={<Btn onClick={() => nav("/")}>{t("e.home")}</Btn>} /></div>;
