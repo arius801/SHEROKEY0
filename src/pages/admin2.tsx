@@ -42,7 +42,11 @@ export function AdminProducts() {
       seoTitle: editing.seoTitle || `Buy ${name} — Instant Delivery | SHEROKEY`,
       seoDescription: editing.seoDescription || name,
     };
-    if (isNew && !p.short.en) { p.short = { en: name, ar: name, ru: name, fr: name }; p.description = p.short; p.requirements = { en: "Internet connection.", ar: "اتصال بالإنترنت.", ru: "Интернет.", fr: "Connexion internet." }; }
+    if (isNew) {
+      p.short = { en: name, ar: editing.name.ar || name, ru: editing.name.ru || name, fr: editing.name.fr || name };
+      p.description = { en: name, ar: editing.name.ar || name, ru: editing.name.ru || name, fr: editing.name.fr || name };
+      p.requirements = { en: "Internet connection.", ar: "اتصال بالإنترنت.", ru: "Интернет.", fr: "Connexion internet." };
+    }
     try { await api.saveProduct(p, isNew); toast(t("c.saved")); setEditing(null); }
     catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
   };

@@ -1306,20 +1306,29 @@ const serverRoutes: Record<string, (...args: never[]) => Promise<unknown> | unkn
 
   /* admin: products (§1) */
   saveProduct: async (p: Product, isNew: boolean) => {
+    const body = {
+      name: p.name,
+      short: p.short,
+      description: p.description,
+      requirements: p.requirements,
+      slug: p.slug,
+      priceMinor: p.priceUsd,
+      compareAtMinor: p.compareAtUsd,
+      categoryId: p.category,
+      deliveryMethod: p.deliveryMethod,
+      durationMonths: p.durationMonths,
+      stock: p.stock,
+      featured: p.featured,
+      isNew: p.isNew,
+      active: p.active,
+      image: p.image,
+      seoTitle: p.seoTitle,
+      seoDescription: p.seoDescription,
+    };
     if (isNew) {
-      await serverFetch("/api/admin/products", { method: "POST", body: {
-        name: p.name.en, slug: p.slug, priceMinor: p.priceUsd, compareAtMinor: p.compareAtUsd,
-        category: p.category, deliveryMethod: p.deliveryMethod, durationMonths: p.durationMonths,
-        stock: p.stock, featured: p.featured, isNew: p.isNew, active: p.active,
-        image: p.image, seoTitle: p.seoTitle, seoDescription: p.seoDescription,
-      }});
+      await serverFetch("/api/admin/products", { method: "POST", body });
     } else {
-      await serverFetch(`/api/admin/products/${p.id}`, { method: "PUT", body: {
-        name: p.name.en, priceMinor: p.priceUsd, compareAtMinor: p.compareAtUsd,
-        category: p.category, deliveryMethod: p.deliveryMethod, durationMonths: p.durationMonths,
-        stock: p.stock, featured: p.featured, isNew: p.isNew, active: p.active,
-        image: p.image, seoTitle: p.seoTitle, seoDescription: p.seoDescription,
-      }});
+      await serverFetch(`/api/admin/products/${p.id}`, { method: "PUT", body });
     }
     await store.refresh();
   },

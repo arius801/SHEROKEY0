@@ -416,13 +416,16 @@ const routes: Record<string, Handler> = {
   /* ---- admin: products (§1/§19) ---- */
   "POST /api/admin/products": async (ctx, user) => {
     const actor = requirePerm(user, "products");
-    const { name, slug, priceMinor, compareAtMinor, category, deliveryMethod, durationMonths, stock, featured, isNew, active, image, seoTitle, seoDescription } = parse(
+    const { name, short, description, requirements, slug, priceMinor, compareAtMinor, categoryId, deliveryMethod, durationMonths, stock, featured, isNew, active, image, seoTitle, seoDescription } = parse(
       z.object({
-        name: z.string().min(2).max(200),
+        name: z.object({ en: z.string().min(2).max(200), ar: z.string().min(2).max(200), ru: z.string().min(2).max(200), fr: z.string().min(2).max(200) }),
+        short: z.object({ en: z.string().max(500), ar: z.string().max(500), ru: z.string().max(500), fr: z.string().max(500) }),
+        description: z.object({ en: z.string().max(5000), ar: z.string().max(5000), ru: z.string().max(5000), fr: z.string().max(5000) }),
+        requirements: z.object({ en: z.string().max(2000), ar: z.string().max(2000), ru: z.string().max(2000), fr: z.string().max(2000) }),
         slug: z.string().min(2).max(120),
         priceMinor: z.number().int().positive(),
         compareAtMinor: z.number().int().positive().nullable(),
-        category: z.string().uuid(),
+        categoryId: z.string().uuid(),
         deliveryMethod: z.enum(["AUTO", "MANUAL"]),
         durationMonths: z.number().int().positive().nullable(),
         stock: z.number().int().min(0),
@@ -437,13 +440,12 @@ const routes: Record<string, Handler> = {
     );
     const d = requireDb();
     const { categories } = await import("./db");
-    const cat = (await d.select().from(categories).where(eq(categories.id, category)).limit(1))[0];
+    const cat = (await d.select().from(categories).where(eq(categories.id, categoryId)).limit(1))[0];
     if (!cat) throw new ApiError("e.categoryNotFound", 400);
     const [product] = await d.insert(products).values({
-      name: { en: name, ar: name, ru: name, fr: name },
-      slug, priceMinor, compareAtMinor, category, deliveryMethod, durationMonths, stock, featured, isNew, active, image, seoTitle, seoDescription,
+      name, short, description, requirements, slug, priceMinor, compareAtMinor, categoryId, deliveryMethod, durationMonths, stock, featured, isNew, active, image, seoTitle, seoDescription,
     }).returning();
-    await audit(actor.id, actor.name, "PRODUCT_CREATED", product.id, name);
+    await audit(actor.id, actor.name, "PRODUCT_CREATED", product.id, name.en);
     return { status: 201, body: product };
   },
 
@@ -452,10 +454,13 @@ const routes: Record<string, Handler> = {
     const id = ctx.path.split("/")[4];
     const updates = parse(
       z.object({
-        name: z.string().min(2).max(200).optional(),
+        name: z.object({ en: z.string().min(2).max(200), ar: z.string().min(2).max(200), ru: z.string().min(2).max(200), fr: z.string().min(2).max(200) }).optional(),
+        short: z.object({ en: z.string().max(500), ar: z.string().max(500), ru: z.string().max(500), fr: z.string().max(500) }).optional(),
+        description: z.object({ en: z.string().max(5000), ar: z.string().max(5000), ru: z.string().max(5000), fr: z.string().max(5000) }).optional(),
+        requirements: z.object({ en: z.string().max(2000), ar: z.string().max(2000), ru: z.string().max(2000), fr: z.string().max(2000) }).optional(),
         priceMinor: z.number().int().positive().optional(),
         compareAtMinor: z.number().int().positive().nullable().optional(),
-        category: z.string().uuid().optional(),
+        categoryId: z.string().uuid().optional(),
         deliveryMethod: z.enum(["AUTO", "MANUAL"]).optional(),
         durationMonths: z.number().int().positive().nullable().optional(),
         stock: z.number().int().min(0).optional(),
@@ -471,7 +476,7 @@ const routes: Record<string, Handler> = {
     const d = requireDb();
     const [updated] = await d.update(products).set(updates).where(eq(products.id, id)).returning();
     if (!updated) throw new ApiError("e.notFound", 404);
-    await audit(actor.id, actor.name, "PRODUCT_UPDATED", id, JSON.stringify(updates));
+    await audit(actor.id, actor.name, "PRODUCT_UPDATED", id, updates.name?.en ?? "");
     return { status: 200, body: updated };
   },
 
@@ -703,8 +708,28 @@ const routes: Record<string, Handler> = {
       for (const r of rows) unusedCounts.set(r.pid, Number(r.n));
     }
     const productsOut = active.map((p) => ({
-      ...p, priceUsd: Number(p.priceMinor), compareAtUsd: p.compareAtMinor != null ? Number(p.compareAtMinor) : null,
+      id: p.id,
+      slug: p.slug,
+      name: p.name,
+      short: p.short,
+      description: p.description,
+      requirements: p.requirements,
+      category: p.categoryId,
+      tags: p.tags,
+      priceUsd: Number(p.priceMinor),
+      compareAtUsd: p.compareAtMinor != null ? Number(p.compareAtMinor) : null,
+      deliveryMethod: p.deliveryMethod,
+      durationMonths: p.durationMonths,
       stock: p.deliveryMethod === "AUTO" ? (unusedCounts.get(p.id) ?? 0) : p.stock,
+      lowStockThreshold: p.lowStockThreshold,
+      active: p.active,
+      featured: p.featured,
+      isNew: p.isNew,
+      image: p.image,
+      accent: p.accent,
+      seoTitle: p.seoTitle,
+      seoDescription: p.seoDescription,
+      createdAt: p.createdAt.getTime(),
     }));
 
     const settingsOut = {
