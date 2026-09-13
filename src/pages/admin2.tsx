@@ -24,7 +24,7 @@ export function AdminProducts() {
     setForm({ name: p.name.en, price: (p.priceUsd / 100).toFixed(2), compare: p.compareAtUsd ? (p.compareAtUsd / 100).toFixed(2) : "", category: p.category, delivery: p.deliveryMethod, duration: p.durationMonths ? String(p.durationMonths) : "", stock: String(p.stock), featured: p.featured, isNew: p.isNew, active: p.active });
     setEditing(p);
   };
-  const save = () => {
+  const save = async () => {
     if (!editing) return;
     const priceUsd = Math.round(parseFloat(form.price) * 100);
     const compareAtUsd = form.compare ? Math.round(parseFloat(form.compare) * 100) : null;
@@ -43,7 +43,12 @@ export function AdminProducts() {
       seoDescription: editing.seoDescription || name,
     };
     if (isNew && !p.short.en) { p.short = { en: name, ar: name, ru: name, fr: name }; p.description = p.short; p.requirements = { en: "Internet connection.", ar: "اتصال بالإنترنت.", ru: "Интернет.", fr: "Connexion internet." }; }
-    try { api.saveProduct(p, isNew); toast(t("c.saved")); setEditing(null); }
+    try { await api.saveProduct(p, isNew); toast(t("c.saved")); setEditing(null); }
+    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+  };
+
+  const handleToggle = async (id: string, flag: "active" | "featured" | "isNew") => {
+    try { await api.toggleProduct(id, flag); toast(t("c.saved")); }
     catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
   };
 
@@ -78,8 +83,8 @@ export function AdminProducts() {
                   <td className="py-2.5 px-2 font-bold tabular-nums" dir="ltr">{fmt(p.priceUsd, "USD")}{p.compareAtUsd && <span className="text-faint line-through ms-1.5 font-semibold">{fmt(p.compareAtUsd, "USD")}</span>}</td>
                   <td className="py-2.5 px-2"><Badge tone={stock <= p.lowStockThreshold ? "ember" : "volt"}>{stock}</Badge></td>
                   <td className="py-2.5 px-2"><Badge tone={p.deliveryMethod === "AUTO" ? "volt" : "ember"}>{p.deliveryMethod === "AUTO" ? t("p.auto") : t("p.manual")}</Badge></td>
-                  <td className="py-2.5 px-2"><button onClick={() => api.toggleProduct(p.id, "featured")} className={`w-9 h-5.5 rounded-full border transition relative ${p.featured ? "bg-volt-500/80 border-volt-500" : "bg-raise border-line"}`} aria-label="featured"><span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${p.featured ? "start-[calc(100%-1.125rem)]" : "start-0.5"}`} /></button></td>
-                  <td className="py-2.5 px-2"><button onClick={() => api.toggleProduct(p.id, "active")} className={`w-9 h-5.5 rounded-full border transition relative ${p.active ? "bg-volt-500/80 border-volt-500" : "bg-raise border-line"}`} aria-label="active"><span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${p.active ? "start-[calc(100%-1.125rem)]" : "start-0.5"}`} /></button></td>
+                  <td className="py-2.5 px-2"><button onClick={() => handleToggle(p.id, "featured")} className={`w-9 h-5.5 rounded-full border transition relative ${p.featured ? "bg-volt-500/80 border-volt-500" : "bg-raise border-line"}`} aria-label="featured"><span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${p.featured ? "start-[calc(100%-1.125rem)]" : "start-0.5"}`} /></button></td>
+                  <td className="py-2.5 px-2"><button onClick={() => handleToggle(p.id, "active")} className={`w-9 h-5.5 rounded-full border transition relative ${p.active ? "bg-volt-500/80 border-volt-500" : "bg-raise border-line"}`} aria-label="active"><span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${p.active ? "start-[calc(100%-1.125rem)]" : "start-0.5"}`} /></button></td>
                   <td className="py-2.5 px-4"><Btn size="xs" variant="soft" onClick={() => openEdit(p)}><IEdit size={12} /> {t("c.edit")}</Btn></td>
                 </tr>
               );
@@ -253,7 +258,7 @@ export function AdminCoupons() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ code: "", type: "PERCENT", value: "10", min: "10", maxUses: "100", maxPer: "1", days: "30" });
 
-  const create = () => {
+  const create = async () => {
     const value = form.type === "PERCENT" ? parseInt(form.value, 10) : Math.round(parseFloat(form.value) * 100);
     if (!form.code.trim() || isNaN(value)) { toast(t("e.generic"), "err"); return; }
     const c: Coupon = {
@@ -262,7 +267,17 @@ export function AdminCoupons() {
       startsAt: Date.now(), expiresAt: Date.now() + parseInt(form.days || "30", 10) * 86400000,
       maxUses: parseInt(form.maxUses, 10) || 1, maxPerCustomer: parseInt(form.maxPer, 10) || 1, uses: 0, active: true, productIds: [],
     };
-    try { api.saveCoupon(c, true); toast(t("c.saved")); setOpen(false); }
+    try { await api.saveCoupon(c, true); toast(t("c.saved")); setOpen(false); }
+    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+  };
+
+  const handleToggle = async (code: string) => {
+    try { await api.toggleCoupon(code); toast(t("c.saved")); }
+    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+  };
+
+  const handleDelete = async (code: string) => {
+    try { await api.deleteCoupon(code); toast(t("c.saved")); }
     catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
   };
 
@@ -286,8 +301,8 @@ export function AdminCoupons() {
               <p>{t("ad.expiresAt")}: {formatDate(c.expiresAt, "en", false)}</p>
             </div>
             <div className="flex gap-2 mt-4">
-              <Btn size="xs" variant="soft" onClick={() => api.toggleCoupon(c.code)}>{c.active ? t("c.disabled") : t("c.enabled")}</Btn>
-              <Btn size="xs" variant="ghost" onClick={() => api.deleteCoupon(c.code)}><IX size={12} /> {t("c.delete")}</Btn>
+              <Btn size="xs" variant="soft" onClick={() => handleToggle(c.code)}>{c.active ? t("c.disabled") : t("c.enabled")}</Btn>
+              <Btn size="xs" variant="ghost" onClick={() => handleDelete(c.code)}><IX size={12} /> {t("c.delete")}</Btn>
             </div>
           </div>
         ))}
@@ -320,6 +335,12 @@ export function AdminCoupons() {
 /* ================= CUSTOMERS ================= */
 export function AdminCustomers() {
   const { db, t, user } = useApp();
+
+  const handleRoleChange = async (userId: string, role: Role) => {
+    try { await api.setRole(userId, role); toast(t("c.saved")); }
+    catch (ex) { toast(t((ex as { code?: string }).code ?? "e.generic"), "err"); }
+  };
+
   return (
     <div className="anim-fade">
       <h2 className="font-display text-lg font-extrabold mb-5">{t("ad.customers")} <span className="text-faint text-sm">({db.users.length})</span></h2>
@@ -344,7 +365,7 @@ export function AdminCustomers() {
                 </td>
                 <td className="py-3 px-2">
                   {can(user, "roles") && u.id !== user?.id ? (
-                    <select className="sk-input !py-1.5 !text-[12px] !w-32" value={u.role} onChange={(e) => { try { api.setRole(u.id, e.target.value as Role); toast(t("c.saved")); } catch (ex) { toast(t((ex as { code?: string }).code ?? "e.generic"), "err"); } }}>
+                    <select className="sk-input !py-1.5 !text-[12px] !w-32" value={u.role} onChange={(e) => handleRoleChange(u.id, e.target.value as Role)}>
                       {["OWNER", "ADMIN", "SUPPORT", "CUSTOMER"].map((r) => <option key={r} value={r}>{r}</option>)}
                     </select>
                   ) : <Badge tone={u.role === "CUSTOMER" ? "dim" : "volt"}>{u.role}</Badge>}

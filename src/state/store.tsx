@@ -1373,6 +1373,10 @@ const serverRoutes: Record<string, (...args: never[]) => Promise<unknown> | unkn
     await serverFetch(`/api/admin/users/${userId}`, { method: "PUT", body: { role } });
     await store.refresh();
   },
+  setRole: async (userId: string, role: Role) => {
+    await serverFetch(`/api/admin/users/${userId}`, { method: "PUT", body: { role } });
+    await store.refresh();
+  },
   updateCustomer: async (userId: string, updates: { role?: Role }) => {
     await serverFetch(`/api/admin/users/${userId}`, { method: "PUT", body: updates });
     await store.refresh();

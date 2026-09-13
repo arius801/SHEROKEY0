@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode, type FormEvent } from "react";
 import { Link, NavLink, useNavigate } from "react-router-dom";
-import { useApp, api, isStaff, store, currentCartItems } from "../state/store";
+import { useApp, api, isStaff, store, currentCartItems, SERVER_MODE } from "../state/store";
 import { LANGS } from "../lib/i18n";
 import { CURRENCIES, formatDate } from "../lib/money";
 import { Btn, Badge, Dropdown, DropItem, Modal, ToastHost } from "./ui";
@@ -139,7 +139,7 @@ function Mailbox() {
               <div className="px-5 py-6 bg-panel text-sm leading-relaxed space-y-3">
                 <p className="font-semibold">{t("mail.hello", { name: selected.toName })}</p>
                 <p className="text-dim">{t("mail.thanks")} <strong className="text-fog">{selected.subject}</strong></p>
-                {selected.sandboxCode && (
+                {!SERVER_MODE && selected.sandboxCode && (
                   <div className="rounded-lg border border-ember-500/30 bg-ember-500/8 p-3.5 text-center">
                     <p className="text-[10px] font-extrabold uppercase tracking-widest text-ember-400 mb-1">Sandbox delivery</p>
                     <p className="font-mono text-2xl font-extrabold tracking-[0.35em]" dir="ltr">{selected.sandboxCode}</p>
