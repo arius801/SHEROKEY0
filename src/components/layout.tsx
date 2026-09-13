@@ -318,7 +318,7 @@ function Footer() {
     [t("f.products"), db.categories.map((c) => [`/catalog?cat=${c.slug}`, c.name.en] as [string, string])],
     [t("f.company"), [["/about", t("nav.about")], ["/support", t("f.contact")], ["/faq", t("nav.faq")]]],
     [t("f.legal"), [["/terms", t("f.terms")], ["/privacy", t("f.privacy")], ["/refunds", t("f.refunds")], ["/cookies", t("f.cookies")]]],
-    [t("f.help"), [["/support", t("nav.support")], ["/account/orders", t("a.orders")], ["/account/keys", t("a.keys")]]],
+    [t("f.help"), [["/support", t("nav.support")], ["/account/orders", t("a.orders")], ["/account/keys", t("a.keys")], ["https://t.me/arius801", "Telegram @arius801"]]],
   ];
   return (
     <footer className="mt-20 border-t border-line bg-panel/50">

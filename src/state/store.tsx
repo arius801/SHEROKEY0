@@ -1303,6 +1303,86 @@ const serverRoutes: Record<string, (...args: never[]) => Promise<unknown> | unkn
   refundOrder: async (orderId: string, reason: string) => { await serverFetch(`/api/admin/orders/${orderId}/refund`, { body: { reason } }); await store.refresh(); },
   completeOrder: async (orderId: string) => { await serverFetch(`/api/admin/orders/${orderId}/complete`, { body: {} }); await store.refresh(); },
   cancelOrder: async (orderId: string) => { await serverFetch(`/api/admin/orders/${orderId}/cancel`, { body: {} }); await store.refresh(); },
+
+  /* admin: products (§1) */
+  saveProduct: async (p: Product, isNew: boolean) => {
+    if (isNew) {
+      await serverFetch("/api/admin/products", { method: "POST", body: {
+        name: p.name.en, slug: p.slug, priceMinor: p.priceUsd, compareAtMinor: p.compareAtUsd,
+        category: p.category, deliveryMethod: p.deliveryMethod, durationMonths: p.durationMonths,
+        stock: p.stock, featured: p.featured, isNew: p.isNew, active: p.active,
+        image: p.image, seoTitle: p.seoTitle, seoDescription: p.seoDescription,
+      }});
+    } else {
+      await serverFetch(`/api/admin/products/${p.id}`, { method: "PUT", body: {
+        name: p.name.en, priceMinor: p.priceUsd, compareAtMinor: p.compareAtUsd,
+        category: p.category, deliveryMethod: p.deliveryMethod, durationMonths: p.durationMonths,
+        stock: p.stock, featured: p.featured, isNew: p.isNew, active: p.active,
+        image: p.image, seoTitle: p.seoTitle, seoDescription: p.seoDescription,
+      }});
+    }
+    await store.refresh();
+  },
+  toggleProduct: async (id: string, flag: "active" | "featured" | "isNew") => {
+    const p = store.db.products.find((x) => x.id === id);
+    if (!p) return;
+    await serverFetch(`/api/admin/products/${id}`, { method: "PUT", body: { [flag]: !p[flag] } });
+    await store.refresh();
+  },
+
+  /* admin: categories (§2) */
+  createCategory: async (name: { en: string; ar: string; ru: string; fr: string }, slug: string, icon: string) => {
+    await serverFetch("/api/admin/categories", { method: "POST", body: { name, slug, icon } });
+    await store.refresh();
+  },
+  updateCategory: async (id: string, updates: { name?: { en: string; ar: string; ru: string; fr: string }; slug?: string; icon?: string }) => {
+    await serverFetch(`/api/admin/categories/${id}`, { method: "PUT", body: updates });
+    await store.refresh();
+  },
+  deleteCategory: async (id: string) => {
+    await serverFetch(`/api/admin/categories/${id}`, { method: "DELETE" });
+    await store.refresh();
+  },
+
+  /* admin: coupons (§1) */
+  saveCoupon: async (c: Coupon, isNew: boolean) => {
+    if (isNew) {
+      await serverFetch("/api/admin/coupons", { method: "POST", body: {
+        code: c.code, type: c.type, value: c.value, minOrderUsdMinor: c.minOrderUsd,
+        startsAt: new Date(c.startsAt).toISOString(), expiresAt: new Date(c.expiresAt).toISOString(),
+        maxUses: c.maxUses, maxPerCustomer: c.maxPerCustomer, active: c.active, productIds: c.productIds,
+      }});
+    } else {
+      const existing = store.db.coupons.find((x) => x.code === c.code);
+      if (!existing) throw new ApiError("e.notFound");
+      await serverFetch(`/api/admin/coupons/${existing.code}`, { method: "PUT", body: {
+        type: c.type, value: c.value, minOrderUsdMinor: c.minOrderUsd,
+        startsAt: new Date(c.startsAt).toISOString(), expiresAt: new Date(c.expiresAt).toISOString(),
+        maxUses: c.maxUses, maxPerCustomer: c.maxPerCustomer, active: c.active, productIds: c.productIds,
+      }});
+    }
+    await store.refresh();
+  },
+  deleteCoupon: async (code: string) => {
+    await serverFetch(`/api/admin/coupons/${code}`, { method: "DELETE" });
+    await store.refresh();
+  },
+
+  /* admin: users/roles (§1/§16) */
+  changeRole: async (userId: string, role: Role) => {
+    await serverFetch(`/api/admin/users/${userId}`, { method: "PUT", body: { role } });
+    await store.refresh();
+  },
+  updateCustomer: async (userId: string, updates: { role?: Role }) => {
+    await serverFetch(`/api/admin/users/${userId}`, { method: "PUT", body: updates });
+    await store.refresh();
+  },
+
+  /* admin: notifications (§14) */
+  createNotification: async (title: string, content: string, type: string, recipientType: "all" | "selected", recipientIds?: string[]) => {
+    await serverFetch("/api/admin/notifications", { method: "POST", body: { title, content, type, recipientType, recipientIds } });
+    await store.refresh();
+  },
 };
 
 const serverApi = new Proxy({} as SandboxApi, {

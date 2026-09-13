@@ -24,15 +24,17 @@ export function Support() {
   const myTickets = user ? db.tickets.filter((tk) => tk.customerId === user.id) : [];
   const myOrders = user ? db.orders.filter((o) => o.customerId === user.id) : [];
 
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!user) return;
+    setBusy(true);
     try {
-      const id = api.createTicket(subject, orderId || null, message);
+      const id = await api.createTicket(subject, orderId || null, message);
       toast(t("s.created"), "ok");
       setSubject(""); setMessage(""); setOrderId("");
       nav(`/support/${id}`);
     } catch (ex) { toast(t((ex as { code?: string }).code ?? "e.generic"), "err"); }
+    finally { setBusy(false); }
   };
 
   return (
@@ -44,13 +46,21 @@ export function Support() {
       </header>
 
       {!user ? (
-        <div className="grid md:grid-cols-2 gap-6">
+        <div className="grid md:grid-cols-3 gap-6">
           <div className="sk-card p-8">
             <IMail size={22} className="text-volt-400 mb-4" />
             <h2 className="font-display text-lg font-bold mb-2">{t("s.contactTitle")}</h2>
             <p className="text-[13.5px] text-dim leading-relaxed">{t("s.contactDesc", { email: db.settings.supportEmail })}</p>
             <a href={`mailto:${db.settings.supportEmail}`} className="inline-flex mt-5 font-mono text-[13px] text-volt-400 hover:underline" dir="ltr">{db.settings.supportEmail}</a>
             <div className="mt-6"><Btn onClick={() => nav("/auth/login")}>{t("au.login")}</Btn></div>
+          </div>
+          <div className="sk-card p-8">
+            <span className="inline-flex w-11 h-11 rounded-xl bg-sky-500/12 border border-sky-500/30 text-sky-400 items-center justify-center mb-4">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.446 1.394c-.14.18-.357.295-.6.295-.002 0-.002 0-.003 0l.213-3.054 5.56-5.022c.24-.213-.054-.334-.373-.121l-6.869 4.326-2.96-.924c-.64-.203-.658-.643.135-.953l11.566-4.458c.538-.196 1.006.128.832.941z"/></svg>
+            </span>
+            <h2 className="font-display text-lg font-bold mb-2">{t("s.telegram")}</h2>
+            <p className="text-[13.5px] text-dim leading-relaxed">{t("s.telegramDesc")}</p>
+            <a href="https://t.me/arius801" target="_blank" rel="noopener noreferrer" className="inline-flex mt-5 font-mono text-[13px] text-sky-400 hover:underline" dir="ltr">@arius801</a>
           </div>
           <div className="sk-card p-8">
             <IClock size={22} className="text-ember-400 mb-4" />

@@ -413,6 +413,268 @@ const routes: Record<string, Handler> = {
     return { status: 200, body: { STRIPE: stripeHealth(), PAYPAL: paypalHealth(), MIR_ACQUIRER: mirHealth() } };
   },
 
+  /* ---- admin: products (§1/§19) ---- */
+  "POST /api/admin/products": async (ctx, user) => {
+    const actor = requirePerm(user, "products");
+    const { name, slug, priceMinor, compareAtMinor, category, deliveryMethod, durationMonths, stock, featured, isNew, active, image, seoTitle, seoDescription } = parse(
+      z.object({
+        name: z.string().min(2).max(200),
+        slug: z.string().min(2).max(120),
+        priceMinor: z.number().int().positive(),
+        compareAtMinor: z.number().int().positive().nullable(),
+        category: z.string().uuid(),
+        deliveryMethod: z.enum(["AUTO", "MANUAL"]),
+        durationMonths: z.number().int().positive().nullable(),
+        stock: z.number().int().min(0),
+        featured: z.boolean(),
+        isNew: z.boolean(),
+        active: z.boolean(),
+        image: z.string().url(),
+        seoTitle: z.string().max(200),
+        seoDescription: z.string().max(500),
+      }),
+      ctx.body
+    );
+    const d = requireDb();
+    const { categories } = await import("./db");
+    const cat = (await d.select().from(categories).where(eq(categories.id, category)).limit(1))[0];
+    if (!cat) throw new ApiError("e.categoryNotFound", 400);
+    const [product] = await d.insert(products).values({
+      name: { en: name, ar: name, ru: name, fr: name },
+      slug, priceMinor, compareAtMinor, category, deliveryMethod, durationMonths, stock, featured, isNew, active, image, seoTitle, seoDescription,
+    }).returning();
+    await audit(actor.id, actor.name, "PRODUCT_CREATED", product.id, name);
+    return { status: 201, body: product };
+  },
+
+  "PUT /api/admin/products/:id": async (ctx, user) => {
+    const actor = requirePerm(user, "products");
+    const id = ctx.path.split("/")[4];
+    const updates = parse(
+      z.object({
+        name: z.string().min(2).max(200).optional(),
+        priceMinor: z.number().int().positive().optional(),
+        compareAtMinor: z.number().int().positive().nullable().optional(),
+        category: z.string().uuid().optional(),
+        deliveryMethod: z.enum(["AUTO", "MANUAL"]).optional(),
+        durationMonths: z.number().int().positive().nullable().optional(),
+        stock: z.number().int().min(0).optional(),
+        featured: z.boolean().optional(),
+        isNew: z.boolean().optional(),
+        active: z.boolean().optional(),
+        image: z.string().url().optional(),
+        seoTitle: z.string().max(200).optional(),
+        seoDescription: z.string().max(500).optional(),
+      }),
+      ctx.body
+    );
+    const d = requireDb();
+    const [updated] = await d.update(products).set(updates).where(eq(products.id, id)).returning();
+    if (!updated) throw new ApiError("e.notFound", 404);
+    await audit(actor.id, actor.name, "PRODUCT_UPDATED", id, JSON.stringify(updates));
+    return { status: 200, body: updated };
+  },
+
+  "DELETE /api/admin/products/:id": async (ctx, user) => {
+    const actor = requirePerm(user, "products");
+    const id = ctx.path.split("/")[4];
+    const d = requireDb();
+    await d.delete(products).where(eq(products.id, id));
+    await audit(actor.id, actor.name, "PRODUCT_DELETED", id, "");
+    return { status: 200, body: { ok: true } };
+  },
+
+  /* ---- admin: categories (§2) ---- */
+  "GET /api/admin/categories": async (_ctx, user) => {
+    requirePerm(user, "products");
+    const d = requireDb();
+    const { categories } = await import("./db");
+    const cats = await d.select().from(categories);
+    return { status: 200, body: cats };
+  },
+
+  "POST /api/admin/categories": async (ctx, user) => {
+    const actor = requirePerm(user, "products");
+    const { name, slug, icon } = parse(
+      z.object({
+        name: z.object({ en: z.string(), ar: z.string(), ru: z.string(), fr: z.string() }),
+        slug: z.string().min(2).max(80),
+        icon: z.string().max(40).default("software"),
+      }),
+      ctx.body
+    );
+    const d = requireDb();
+    const { categories } = await import("./db");
+    const [cat] = await d.insert(categories).values({ name, slug, icon }).returning();
+    await audit(actor.id, actor.name, "CATEGORY_CREATED", cat.id, slug);
+    return { status: 201, body: cat };
+  },
+
+  "PUT /api/admin/categories/:id": async (ctx, user) => {
+    const actor = requirePerm(user, "products");
+    const id = ctx.path.split("/")[4];
+    const updates = parse(
+      z.object({
+        name: z.object({ en: z.string(), ar: z.string(), ru: z.string(), fr: z.string() }).optional(),
+        slug: z.string().min(2).max(80).optional(),
+        icon: z.string().max(40).optional(),
+      }),
+      ctx.body
+    );
+    const d = requireDb();
+    const { categories } = await import("./db");
+    const [updated] = await d.update(categories).set(updates).where(eq(categories.id, id)).returning();
+    if (!updated) throw new ApiError("e.notFound", 404);
+    await audit(actor.id, actor.name, "CATEGORY_UPDATED", id, JSON.stringify(updates));
+    return { status: 200, body: updated };
+  },
+
+  "DELETE /api/admin/categories/:id": async (ctx, user) => {
+    const actor = requirePerm(user, "products");
+    const id = ctx.path.split("/")[4];
+    const d = requireDb();
+    const { categories } = await import("./db");
+    const linked = (await d.select({ id: products.id }).from(products).where(eq(products.category, id)).limit(1))[0];
+    if (linked) throw new ApiError("e.categoryHasProducts", 409);
+    await d.delete(categories).where(eq(categories.id, id));
+    await audit(actor.id, actor.name, "CATEGORY_DELETED", id, "");
+    return { status: 200, body: { ok: true } };
+  },
+
+  /* ---- admin: coupons (§1/§19) ---- */
+  "POST /api/admin/coupons": async (ctx, user) => {
+    const actor = requirePerm(user, "coupons");
+    const { code, type, value, minOrderUsdMinor, startsAt, expiresAt, maxUses, maxPerCustomer, active, productIds } = parse(
+      z.object({
+        code: z.string().min(3).max(40),
+        type: z.enum(["PERCENT", "FIXED"]),
+        value: z.number().int().positive(),
+        minOrderUsdMinor: z.number().int().min(0),
+        startsAt: z.string().datetime(),
+        expiresAt: z.string().datetime(),
+        maxUses: z.number().int().positive(),
+        maxPerCustomer: z.number().int().positive(),
+        active: z.boolean(),
+        productIds: z.array(z.string().uuid()),
+      }),
+      ctx.body
+    );
+    const d = requireDb();
+    const [coupon] = await d.insert(coupons).values({
+      code: code.toUpperCase(), type, value, minOrderUsdMinor, startsAt: new Date(startsAt), expiresAt: new Date(expiresAt), maxUses, maxPerCustomer, active, productIds,
+    }).returning();
+    await audit(actor.id, actor.name, "COUPON_CREATED", coupon.id, code);
+    return { status: 201, body: coupon };
+  },
+
+  "PUT /api/admin/coupons/:code": async (ctx, user) => {
+    const actor = requirePerm(user, "coupons");
+    const code = ctx.path.split("/")[4];
+    const updates = parse(
+      z.object({
+        type: z.enum(["PERCENT", "FIXED"]).optional(),
+        value: z.number().int().positive().optional(),
+        minOrderUsdMinor: z.number().int().min(0).optional(),
+        startsAt: z.string().datetime().optional(),
+        expiresAt: z.string().datetime().optional(),
+        maxUses: z.number().int().positive().optional(),
+        maxPerCustomer: z.number().int().positive().optional(),
+        active: z.boolean().optional(),
+        productIds: z.array(z.string().uuid()).optional(),
+      }),
+      ctx.body
+    );
+    if (updates.startsAt) updates.startsAt = new Date(updates.startsAt) as any;
+    if (updates.expiresAt) updates.expiresAt = new Date(updates.expiresAt) as any;
+    const d = requireDb();
+    const [updated] = await d.update(coupons).set(updates).where(eq(coupons.code, code)).returning();
+    if (!updated) throw new ApiError("e.notFound", 404);
+    await audit(actor.id, actor.name, "COUPON_UPDATED", code, JSON.stringify(updates));
+    return { status: 200, body: updated };
+  },
+
+  "DELETE /api/admin/coupons/:code": async (ctx, user) => {
+    const actor = requirePerm(user, "coupons");
+    const code = ctx.path.split("/")[4];
+    const d = requireDb();
+    await d.delete(coupons).where(eq(coupons.code, code));
+    await audit(actor.id, actor.name, "COUPON_DELETED", code, "");
+    return { status: 200, body: { ok: true } };
+  },
+
+  /* ---- admin: users/roles (§1/§16) ---- */
+  "GET /api/admin/users": async (_ctx, user) => {
+    requirePerm(user, "customers");
+    const d = requireDb();
+    const usersList = await d.select({
+      id: users.id, name: users.name, email: users.email, role: users.role, lang: users.lang, currency: users.currency, emailVerified: users.emailVerified, createdAt: users.createdAt,
+    }).from(users);
+    return { status: 200, body: usersList };
+  },
+
+  "PUT /api/admin/users/:id": async (ctx, user) => {
+    const actor = requirePerm(user, "customers");
+    const id = ctx.path.split("/")[4];
+    const { role } = parse(z.object({ role: z.enum(["CUSTOMER", "SUPPORT", "ADMIN", "OWNER"]) }), ctx.body);
+    if (role === "OWNER" && actor.role !== "OWNER") throw new ApiError("e.forbidden", 403);
+    const d = requireDb();
+    const [updated] = await d.update(users).set({ role }).where(eq(users.id, id)).returning({ id: users.id, name: users.name, email: users.email, role: users.role });
+    if (!updated) throw new ApiError("e.notFound", 404);
+    await audit(actor.id, actor.name, "USER_ROLE_CHANGED", id, role);
+    return { status: 200, body: updated };
+  },
+
+  /* ---- admin: notifications (§14) ---- */
+  "POST /api/admin/notifications": async (ctx, user) => {
+    const actor = requirePerm(user, "settings");
+    const { title, content, type, recipientType, recipientIds } = parse(
+      z.object({
+        title: z.string().min(2).max(200),
+        content: z.string().min(5).max(2000),
+        type: z.enum(["discount", "offer", "coupon", "announcement", "new_product", "maintenance", "general"]),
+        recipientType: z.enum(["all", "selected"]),
+        recipientIds: z.array(z.string().uuid()).optional(),
+      }),
+      ctx.body
+    );
+    const d = requireDb();
+    const { broadcastNotifications } = await import("./db");
+    const [notif] = await d.insert(broadcastNotifications).values({
+      title, content, type, recipientType, recipientIds: recipientIds ?? [], createdBy: actor.id,
+    }).returning();
+    await audit(actor.id, actor.name, "NOTIFICATION_CREATED", notif.id, type);
+    return { status: 201, body: notif };
+  },
+
+  "GET /api/admin/notifications": async (_ctx, user) => {
+    requirePerm(user, "settings");
+    const d = requireDb();
+    const { broadcastNotifications } = await import("./db");
+    const notifs = await d.select().from(broadcastNotifications).orderBy(broadcastNotifications.createdAt);
+    return { status: 200, body: notifs };
+  },
+
+  /* ---- admin: contacts/support (§4) ---- */
+  "GET /api/admin/contacts": async (_ctx, user) => {
+    requirePerm(user, "tickets");
+    const d = requireDb();
+    const contacts = await d.select().from(supportTickets).orderBy(supportTickets.createdAt);
+    return { status: 200, body: contacts };
+  },
+
+  "POST /api/admin/contacts/:id/reply": async (ctx, user) => {
+    const actor = requirePerm(user, "tickets");
+    const id = ctx.path.split("/")[4];
+    const { message } = parse(z.object({ message: z.string().min(2).max(4000) }), ctx.body);
+    const d = requireDb();
+    const ticket = (await d.select().from(supportTickets).where(eq(supportTickets.id, id)).limit(1))[0];
+    if (!ticket) throw new ApiError("e.notFound", 404);
+    await d.insert(supportTicketMessages).values({ ticketId: id, authorId: actor.id, staff: true, text: message });
+    await d.update(supportTickets).set({ updatedAt: new Date() }).where(eq(supportTickets.id, id));
+    await audit(actor.id, actor.name, "TICKET_REPLIED", id, "");
+    return { status: 200, body: { ok: true } };
+  },
+
   /* ---- webhooks (§15/§21 — signature FIRST, idempotent, raw body) ---- */
   "POST /api/webhooks/stripe": async (ctx) => ({ status: 200, body: await handleStripeWebhook(ctx.body, ctx.headers["stripe-signature"] ?? "") }),
   "POST /api/webhooks/paypal": async (ctx) => ({ status: 200, body: await handlePayPalWebhook(ctx.headers, ctx.body) }),

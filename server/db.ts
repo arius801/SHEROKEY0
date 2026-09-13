@@ -294,6 +294,17 @@ export const notifications = pgTable("notifications", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("notif_user_idx").on(t.userId, t.read)]);
 
+export const broadcastNotifications = pgTable("broadcast_notifications", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  title: varchar("title", { length: 200 }).notNull(),
+  content: text("content").notNull(),
+  type: varchar("type", { length: 40 }).notNull(), // discount, offer, coupon, announcement, new_product, maintenance, general
+  recipientType: varchar("recipient_type", { length: 20 }).notNull(), // all, selected
+  recipientIds: jsonb("recipient_ids").$type<string[]>().notNull().default([]),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("broadcast_notif_type_idx").on(t.type)]);
+
 export const supportTickets = pgTable("support_tickets", {
   id: uuid("id").primaryKey().defaultRandom(),
   customerId: uuid("customer_id").notNull().references(() => users.id),
