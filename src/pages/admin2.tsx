@@ -7,17 +7,45 @@ import type { Coupon, Product, Role } from "../lib/types";
 import { Badge, Btn, Empty, Field, Input, KeyBadge, Modal, SearchBox, Select, Textarea, toast } from "../components/ui";
 import { IBox, IKey, ITag, IUsers, IMail, IFile, IPlus, IUpload, IDownload, IBan, IEdit, ICheck, IX, ISend, IRefresh, IAlert, ILifebuoy, IWrench } from "../components/icons";
 
+/** Convert API error codes to user-friendly localized messages */
+function getErrorMessage(code: string | undefined, t: (key: string) => string): string {
+  if (!code) return t("e.generic");
+  // Handle validation errors like "e.validation:categoryId"
+  if (code.startsWith("e.validation:")) {
+    const field = code.split(":")[1];
+    const fieldKey = `e.validation:${field}`;
+    const translated = t(fieldKey);
+    // If translation exists and is different from key, use it
+    if (translated !== fieldKey) return translated;
+    return t("e.validation");
+  }
+  // Try direct translation
+  const translated = t(code);
+  if (translated !== code) return translated;
+  // Fallback messages for common errors
+  const fallbacks: Record<string, string> = {
+    "e.notFound": "Not found",
+    "e.forbidden": "Permission denied",
+    "e.session": "Please log in again",
+    "e.categoryNotFound": "Category not found",
+    "e.generic": "An error occurred",
+  };
+  return fallbacks[code] || t("e.generic");
+}
+
 /* ================= PRODUCTS ================= */
 export function AdminProducts() {
   const { db, t, fmt } = useApp();
   const [editing, setEditing] = useState<Product | null>(null);
   const [isNew, setIsNew] = useState(false);
-  const [form, setForm] = useState({ name: "", price: "", compare: "", category: "software", delivery: "AUTO", duration: "", stock: "10", featured: false, isNew: false, active: true });
+  const [form, setForm] = useState({ name: "", price: "", compare: "", category: "", delivery: "AUTO", duration: "", stock: "10", featured: false, isNew: false, active: true });
 
   const openNew = () => {
     setIsNew(true);
-    setForm({ name: "", price: "19.99", compare: "", category: "software", delivery: "AUTO", duration: "", stock: "10", featured: false, isNew: true, active: true });
-    setEditing({ id: "", slug: "", name: { en: "", ar: "", ru: "", fr: "" }, short: { en: "", ar: "", ru: "", fr: "" }, description: { en: "", ar: "", ru: "", fr: "" }, requirements: { en: "", ar: "", ru: "", fr: "" }, category: "software", tags: [], priceUsd: 1999, compareAtUsd: null, deliveryMethod: "AUTO", durationMonths: null, stock: 10, lowStockThreshold: 5, active: true, featured: false, isNew: true, image: db.products[0]?.image ?? "", accent: "#2fc98a", seoTitle: "", seoDescription: "", createdAt: 0 });
+    // Use first category ID if available, otherwise empty
+    const defaultCategory = db.categories[0]?.id ?? "";
+    setForm({ name: "", price: "19.99", compare: "", category: defaultCategory, delivery: "AUTO", duration: "", stock: "10", featured: false, isNew: true, active: true });
+    setEditing({ id: "", slug: "", name: { en: "", ar: "", ru: "", fr: "" }, short: { en: "", ar: "", ru: "", fr: "" }, description: { en: "", ar: "", ru: "", fr: "" }, requirements: { en: "", ar: "", ru: "", fr: "" }, category: defaultCategory, tags: [], priceUsd: 1999, compareAtUsd: null, deliveryMethod: "AUTO", durationMonths: null, stock: 10, lowStockThreshold: 5, active: true, featured: false, isNew: true, image: db.products[0]?.image ?? "", accent: "#2fc98a", seoTitle: "", seoDescription: "", createdAt: 0 });
   };
   const openEdit = (p: Product) => {
     setIsNew(false);
@@ -48,12 +76,12 @@ export function AdminProducts() {
       p.requirements = { en: "Internet connection.", ar: "اتصال بالإنترنت.", ru: "Интернет.", fr: "Connexion internet." };
     }
     try { await api.saveProduct(p, isNew); toast(t("c.saved")); setEditing(null); }
-    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+    catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
   };
 
   const handleToggle = async (id: string, flag: "active" | "featured" | "isNew") => {
     try { await api.toggleProduct(id, flag); toast(t("c.saved")); }
-    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+    catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
   };
 
   return (
@@ -165,12 +193,12 @@ export function AdminKeys() {
     try {
       const n = api.importKeys(product, bulk);
       toast(t("ad.keysAdded", { n }), "ok"); setBulk(""); setImportOpen(false);
-    } catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+    } catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
   };
   const doSingle = () => {
     if (!single.trim()) return;
     try { const n = api.importKeys(product, single); toast(t("ad.keysAdded", { n }), "ok"); setSingle(""); }
-    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+    catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
   };
 
   return (
@@ -229,7 +257,7 @@ export function AdminKeys() {
                   <td className="py-2.5 px-2 text-faint font-semibold text-[11px]">{k.deliveredAt ? formatDate(k.deliveredAt, user?.lang ?? "en") : "—"}</td>
                   <td className="py-2.5 px-4">
                     {(k.status === "UNUSED" || k.status === "RESERVED") && can(user, "keys") && (
-                      <button onClick={() => { try { api.revokeKey(k.id); toast(t("c.saved"), "info"); } catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); } }}
+                      <button onClick={() => { try { api.revokeKey(k.id); toast(t("c.saved"), "info"); } catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); } }}
                         className="text-faint hover:text-danger-400 transition" aria-label="revoke"><IBan size={14} /></button>
                     )}
                   </td>
@@ -272,17 +300,17 @@ export function AdminCoupons() {
       maxUses: parseInt(form.maxUses, 10) || 1, maxPerCustomer: parseInt(form.maxPer, 10) || 1, uses: 0, active: true, productIds: [],
     };
     try { await api.saveCoupon(c, true); toast(t("c.saved")); setOpen(false); }
-    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+    catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
   };
 
   const handleToggle = async (code: string) => {
     try { await api.toggleCoupon(code); toast(t("c.saved")); }
-    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+    catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
   };
 
   const handleDelete = async (code: string) => {
     try { await api.deleteCoupon(code); toast(t("c.saved")); }
-    catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); }
+    catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
   };
 
   return (
@@ -342,7 +370,7 @@ export function AdminCustomers() {
 
   const handleRoleChange = async (userId: string, role: Role) => {
     try { await api.setRole(userId, role); toast(t("c.saved")); }
-    catch (ex) { toast(t((ex as { code?: string }).code ?? "e.generic"), "err"); }
+    catch (ex) { toast(getErrorMessage((ex as { code?: string }).code, t), "err"); }
   };
 
   return (
@@ -436,7 +464,7 @@ export function AdminEmails() {
           <h2 className="font-display text-lg font-extrabold">{t("ad.emailLog")}</h2>
           <p className="text-[12px] text-faint font-semibold mt-0.5">{t("ad.provider")}: {db.settings.emailProvider} · {db.settings.emailFrom}</p>
         </div>
-        <Btn size="sm" variant="soft" onClick={() => { try { api.sendTestEmail(); toast(t("ad.testSent"), "info"); } catch (e) { toast(t((e as { code?: string }).code ?? "e.generic"), "err"); } }}>
+        <Btn size="sm" variant="soft" onClick={() => { try { api.sendTestEmail(); toast(t("ad.testSent"), "info"); } catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); } }}>
           <ISend size={13} /> {t("ad.testEmail")}
         </Btn>
       </div>

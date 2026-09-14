@@ -140,6 +140,8 @@ const en = {
   "e.already": "Already processed", "e.selfRole": "You cannot change your own role",
   "e.rateLimit": "Too many attempts — please wait a moment", "e.notReady": "The store is still initializing",
   "e.transition": "This order has already been processed",
+  "e.validation": "Invalid data — please check your input",
+  "e.categoryNotFound": "Category not found — please refresh and try again",
   "init.failed": "The store failed to open the vault. Your workspace data may be corrupted.",
   "init.retry": "Retry", "init.reset": "Reset workspace & reload",
   "init.apiRequired": "This production build has no API configured. Rebuild with VITE_API_URL pointing at the SHEROKEY server (see DEPLOYMENT.md). The browser sandbox is development-only and is never used in production.",

@@ -842,13 +842,29 @@ const routeMap: Record<string, Handler> = Object.fromEntries(
   }),
 );
 
+/** Normalize request path: replace any segment that looks like an ID with :id
+ *  Supports: UUIDs, coupon codes, and other identifiers */
+const normalizeRequestPath = (path: string): string => {
+  const segments = path.split("/");
+  return segments.map((seg, i) => {
+    // Skip first empty segment and known non-ID segments
+    if (i === 0 || seg === "") return seg;
+    // UUID pattern
+    if (/^[0-9a-fA-F-]{36}$/.test(seg)) return ":id";
+    // Coupon code pattern (uppercase alphanumeric, 3-40 chars)
+    if (/^[A-Z0-9_-]{3,40}$/.test(seg) && i >= 4) return ":id";
+    return seg;
+  }).join("/");
+};
+
 export async function handle(ctx: Ctx): Promise<ApiResult> {
   const isWebhook = ctx.path.startsWith("/api/webhooks/");
   try {
     if (!isWebhook && ["POST", "PUT", "PATCH", "DELETE"].includes(ctx.method) && !csrfOk(ctx))
       return { status: 403, body: { error: "CSRF" }, headers: SECURITY_HEADERS };
     const user = isWebhook ? null : await resolveSession(ctx.headers.cookie);
-    const key = `${ctx.method} ${ctx.path.replace(/\/[0-9a-fA-F-]{36}(?=\/|$)/g, "/:id")}`;
+    const normalizedPath = normalizeRequestPath(ctx.path);
+    const key = `${ctx.method} ${normalizedPath}`;
     const handler = routeMap[key] ?? routeMap[`${ctx.method} ${ctx.path}`];
     if (!handler) return { status: 404, body: { error: "not_found" }, headers: SECURITY_HEADERS };
     const res = await handler(ctx, user);
