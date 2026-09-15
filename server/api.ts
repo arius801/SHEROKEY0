@@ -539,7 +539,7 @@ const routes: Record<string, Handler> = {
     const id = ctx.path.split("/")[4];
     const d = requireDb();
     const { categories } = await import("./db");
-    const linked = (await d.select({ id: products.id }).from(products).where(eq(products.category, id)).limit(1))[0];
+    const linked = (await d.select({ id: products.id }).from(products).where(eq(products.categoryId, id)).limit(1))[0];
     if (linked) throw new ApiError("e.categoryHasProducts", 409);
     await d.delete(categories).where(eq(categories.id, id));
     await audit(actor.id, actor.name, "CATEGORY_DELETED", id, "");

@@ -1178,6 +1178,37 @@ const sandboxApi = {
       audit(d, actor, "PAYMENT_ROUTING", "routing", Object.entries(patch).map(([k, v]) => `${k}→${v}`).join(","));
     });
   },
+
+  /* ---------- categories ---------- */
+  createCategory(name: { en: string; ar: string; ru: string; fr: string }, slug: string, icon: "software" | "entertainment" | "gaming" | "security" | "ai") {
+    const actor = requirePerm("products");
+    store.mutate((d) => {
+      d.categories.push({ id: uid("cat"), slug, name, icon });
+      audit(d, actor, "CATEGORY_CREATED", slug, name.en);
+    });
+  },
+
+  updateCategory(id: string, updates: { name?: { en: string; ar: string; ru: string; fr: string }; slug?: string; icon?: "software" | "entertainment" | "gaming" | "security" | "ai" }) {
+    const actor = requirePerm("products");
+    store.mutate((d) => {
+      const cat = d.categories.find((c) => c.id === id);
+      if (!cat) throw new ApiError("e.notFound");
+      if (updates.name) cat.name = updates.name;
+      if (updates.slug) cat.slug = updates.slug;
+      if (updates.icon) cat.icon = updates.icon;
+      audit(d, actor, "CATEGORY_UPDATED", id, updates.name?.en ?? "");
+    });
+  },
+
+  deleteCategory(id: string) {
+    const actor = requirePerm("products");
+    store.mutate((d) => {
+      const linked = d.products.some((p) => p.category === id);
+      if (linked) throw new ApiError("e.categoryHasProducts");
+      d.categories = d.categories.filter((c) => c.id !== id);
+      audit(d, actor, "CATEGORY_DELETED", id, "");
+    });
+  },
 };
 
 /* ------------------------------------------------------------------ */

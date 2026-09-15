@@ -288,19 +288,53 @@ export function AdminKeys() {
 export function AdminCoupons() {
   const { db, t, fmt } = useApp();
   const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<Coupon | null>(null);
   const [form, setForm] = useState({ code: "", type: "PERCENT", value: "10", min: "10", maxUses: "100", maxPer: "1", days: "30" });
 
-  const create = async () => {
+  const resetForm = () => {
+    setForm({ code: "", type: "PERCENT", value: "10", min: "10", maxUses: "100", maxPer: "1", days: "30" });
+  };
+
+  const openCreate = () => {
+    resetForm();
+    setEditing(null);
+    setOpen(true);
+  };
+
+  const openEdit = (c: Coupon) => {
+    setEditing(c);
+    setForm({
+      code: c.code,
+      type: c.type,
+      value: c.type === "PERCENT" ? String(c.value) : (c.value / 100).toFixed(2),
+      min: (c.minOrderUsd / 100).toFixed(2),
+      maxUses: String(c.maxUses),
+      maxPer: String(c.maxPerCustomer),
+      days: String(Math.round((c.expiresAt - c.startsAt) / 86400000)),
+    });
+    setOpen(true);
+  };
+
+  const save = async () => {
     const value = form.type === "PERCENT" ? parseInt(form.value, 10) : Math.round(parseFloat(form.value) * 100);
     if (!form.code.trim() || isNaN(value)) { toast(t("e.generic"), "err"); return; }
     const c: Coupon = {
       code: form.code.trim().toUpperCase(), type: form.type as Coupon["type"], value,
       minOrderUsd: Math.round(parseFloat(form.min || "0") * 100),
-      startsAt: Date.now(), expiresAt: Date.now() + parseInt(form.days || "30", 10) * 86400000,
-      maxUses: parseInt(form.maxUses, 10) || 1, maxPerCustomer: parseInt(form.maxPer, 10) || 1, uses: 0, active: true, productIds: [],
+      startsAt: editing ? editing.startsAt : Date.now(),
+      expiresAt: editing ? editing.expiresAt : Date.now() + parseInt(form.days || "30", 10) * 86400000,
+      maxUses: parseInt(form.maxUses, 10) || 1, maxPerCustomer: parseInt(form.maxPer, 10) || 1,
+      uses: editing ? editing.uses : 0, active: editing ? editing.active : true, productIds: editing ? editing.productIds : [],
     };
-    try { await api.saveCoupon(c, true); toast(t("c.saved")); setOpen(false); }
-    catch (e) { toast(getErrorMessage((e as { code?: string }).code, t), "err"); }
+    try {
+      await api.saveCoupon(c, !editing);
+      toast(t("c.saved"));
+      setOpen(false);
+      setEditing(null);
+      resetForm();
+    } catch (e) {
+      toast(getErrorMessage((e as { code?: string }).code, t), "err");
+    }
   };
 
   const handleToggle = async (code: string) => {
@@ -317,7 +351,7 @@ export function AdminCoupons() {
     <div className="anim-fade">
       <div className="flex items-center justify-between mb-5">
         <h2 className="font-display text-lg font-extrabold">{t("ad.coupons")}</h2>
-        <Btn size="sm" onClick={() => setOpen(true)}><IPlus size={14} /> {t("ad.createCoupon")}</Btn>
+        <Btn size="sm" onClick={openCreate}><IPlus size={14} /> {t("ad.createCoupon")}</Btn>
       </div>
       <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4">
         {db.coupons.map((c) => (
@@ -333,13 +367,14 @@ export function AdminCoupons() {
               <p>{t("ad.expiresAt")}: {formatDate(c.expiresAt, "en", false)}</p>
             </div>
             <div className="flex gap-2 mt-4">
+              <Btn size="xs" variant="soft" onClick={() => openEdit(c)}><IEdit size={12} /> {t("c.edit")}</Btn>
               <Btn size="xs" variant="soft" onClick={() => handleToggle(c.code)}>{c.active ? t("c.disabled") : t("c.enabled")}</Btn>
               <Btn size="xs" variant="ghost" onClick={() => handleDelete(c.code)}><IX size={12} /> {t("c.delete")}</Btn>
             </div>
           </div>
         ))}
       </div>
-      <Modal open={open} onClose={() => setOpen(false)} title={t("ad.createCoupon")}>
+      <Modal open={open} onClose={() => { setOpen(false); setEditing(null); resetForm(); }} title={editing ? t("c.edit") : t("ad.createCoupon")}>
         <div className="space-y-4">
           <Field label={t("ad.couponCode")}><Input value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value.toUpperCase() })} placeholder="SUMMER20" dir="ltr" /></Field>
           <div className="grid grid-cols-2 gap-4">
@@ -355,8 +390,141 @@ export function AdminCoupons() {
             <Field label={`${t("ad.expiresAt")} (days)`}><Input value={form.days} onChange={(e) => setForm({ ...form, days: e.target.value })} dir="ltr" /></Field>
           </div>
           <div className="flex gap-2 justify-end">
-            <Btn variant="ghost" onClick={() => setOpen(false)}>{t("c.cancel")}</Btn>
-            <Btn onClick={create}><ICheck size={15} /> {t("c.create")}</Btn>
+            <Btn variant="ghost" onClick={() => { setOpen(false); setEditing(null); resetForm(); }}>{t("c.cancel")}</Btn>
+            <Btn onClick={save}><ICheck size={15} /> {t("c.save")}</Btn>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+/* ================= CATEGORIES ================= */
+type CategoryIcon = "software" | "entertainment" | "gaming" | "security" | "ai";
+
+export function AdminCategories() {
+  const { db, t } = useApp();
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<{ id: string; name: { en: string; ar: string; ru: string; fr: string }; slug: string; icon: CategoryIcon } | null>(null);
+  const [form, setForm] = useState({ slug: "", icon: "software" as CategoryIcon, nameEn: "", nameAr: "", nameRu: "", nameFr: "" });
+
+  const resetForm = () => {
+    setForm({ slug: "", icon: "software", nameEn: "", nameAr: "", nameRu: "", nameFr: "" });
+  };
+
+  const openCreate = () => {
+    resetForm();
+    setEditing(null);
+    setOpen(true);
+  };
+
+  const openEdit = (cat: typeof db.categories[0]) => {
+    setEditing({ id: cat.id, name: cat.name, slug: cat.slug, icon: cat.icon });
+    setForm({
+      slug: cat.slug,
+      icon: cat.icon,
+      nameEn: cat.name.en,
+      nameAr: cat.name.ar,
+      nameRu: cat.name.ru,
+      nameFr: cat.name.fr,
+    });
+    setOpen(true);
+  };
+
+  const save = async () => {
+    if (!form.slug.trim() || !form.nameEn.trim()) {
+      toast(t("e.generic"), "err");
+      return;
+    }
+    const name = {
+      en: form.nameEn.trim(),
+      ar: form.nameAr.trim() || form.nameEn.trim(),
+      ru: form.nameRu.trim() || form.nameEn.trim(),
+      fr: form.nameFr.trim() || form.nameEn.trim(),
+    };
+    try {
+      if (editing) {
+        await api.updateCategory(editing.id, { name, slug: form.slug.trim(), icon: form.icon });
+      } else {
+        await api.createCategory(name, form.slug.trim(), form.icon);
+      }
+      toast(t("c.saved"));
+      setOpen(false);
+      setEditing(null);
+      resetForm();
+    } catch (e) {
+      toast(getErrorMessage((e as { code?: string }).code, t), "err");
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    try {
+      await api.deleteCategory(id);
+      toast(t("c.saved"));
+    } catch (e) {
+      toast(getErrorMessage((e as { code?: string }).code, t), "err");
+    }
+  };
+
+  const productCount = (catId: string) => db.products.filter((p) => p.category === catId).length;
+
+  return (
+    <div className="anim-fade">
+      <div className="flex items-center justify-between mb-5">
+        <h2 className="font-display text-lg font-extrabold">{t("c.category")} <span className="text-faint text-sm">({db.categories.length})</span></h2>
+        <Btn size="sm" onClick={openCreate}><IPlus size={14} /> {t("c.create")}</Btn>
+      </div>
+      <div className="sk-card overflow-x-auto">
+        <table className="w-full text-[12.5px] min-w-[600px]">
+          <thead><tr className="text-faint text-[10.5px] uppercase tracking-wider border-b border-line bg-raise/50">
+            <th className="text-start font-extrabold py-3 px-4">{t("c.category")}</th>
+            <th className="text-start font-extrabold py-3 px-2">Slug</th>
+            <th className="text-start font-extrabold py-3 px-2">Icon</th>
+            <th className="text-start font-extrabold py-3 px-2">{t("ad.products")}</th>
+            <th className="text-start font-extrabold py-3 px-4"></th>
+          </tr></thead>
+          <tbody>
+            {db.categories.map((cat) => (
+              <tr key={cat.id} className="border-b border-line/50 last:border-0 hover:bg-raise/60 transition">
+                <td className="py-3 px-4">
+                  <p className="font-bold">{cat.name.en}</p>
+                  <p className="text-[10.5px] text-faint font-semibold">{cat.name.ar} · {cat.name.ru} · {cat.name.fr}</p>
+                </td>
+                <td className="py-3 px-2 font-mono text-[11px] text-dim" dir="ltr">{cat.slug}</td>
+                <td className="py-3 px-2 font-mono text-[11px] text-dim">{cat.icon}</td>
+                <td className="py-3 px-2"><Badge tone="volt">{productCount(cat.id)}</Badge></td>
+                <td className="py-3 px-4">
+                  <div className="flex gap-2">
+                    <Btn size="xs" variant="soft" onClick={() => openEdit(cat)}><IEdit size={12} /> {t("c.edit")}</Btn>
+                    <Btn size="xs" variant="ghost" onClick={() => handleDelete(cat.id)} disabled={productCount(cat.id) > 0}><IX size={12} /> {t("c.delete")}</Btn>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {db.categories.length === 0 && <tr><td colSpan={5}><Empty icon={<IBox size={20} />} title={t("c.noResults")} /></td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      <Modal open={open} onClose={() => { setOpen(false); setEditing(null); resetForm(); }} title={editing ? t("c.edit") : t("c.create")}>
+        <div className="space-y-4">
+          <Field label="Slug"><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") })} placeholder="software" dir="ltr" /></Field>
+          <Field label="Icon">
+            <Select value={form.icon} onChange={(e) => setForm({ ...form, icon: e.target.value as CategoryIcon })}>
+              <option value="software">Software</option>
+              <option value="entertainment">Entertainment</option>
+              <option value="gaming">Gaming</option>
+              <option value="security">Security</option>
+              <option value="ai">AI</option>
+            </Select>
+          </Field>
+          <Field label="Name (EN)"><Input value={form.nameEn} onChange={(e) => setForm({ ...form, nameEn: e.target.value })} /></Field>
+          <Field label="Name (AR)"><Input value={form.nameAr} onChange={(e) => setForm({ ...form, nameAr: e.target.value })} /></Field>
+          <Field label="Name (RU)"><Input value={form.nameRu} onChange={(e) => setForm({ ...form, nameRu: e.target.value })} /></Field>
+          <Field label="Name (FR)"><Input value={form.nameFr} onChange={(e) => setForm({ ...form, nameFr: e.target.value })} /></Field>
+          <div className="flex gap-2 justify-end pt-2">
+            <Btn variant="ghost" onClick={() => { setOpen(false); setEditing(null); resetForm(); }}>{t("c.cancel")}</Btn>
+            <Btn onClick={save}><ICheck size={15} /> {t("c.save")}</Btn>
           </div>
         </div>
       </Modal>

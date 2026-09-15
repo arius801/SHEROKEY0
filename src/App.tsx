@@ -31,6 +31,7 @@ const Admin2 = (name: string) => lazy(() => import("./pages/admin2").then((m) =>
 const AdminProducts = Admin2("AdminProducts");
 const AdminKeys = Admin2("AdminKeys");
 const AdminCoupons = Admin2("AdminCoupons");
+const AdminCategories = Admin2("AdminCategories");
 const AdminCustomers = Admin2("AdminCustomers");
 const AdminTickets = Admin2("AdminTickets");
 const AdminEmails = Admin2("AdminEmails");
@@ -184,6 +185,7 @@ export default function App() {
                 <Route path="/admin/products" element={<AdminShellLazy><AdminProducts /></AdminShellLazy>} />
                 <Route path="/admin/keys" element={<AdminShellLazy><AdminKeys /></AdminShellLazy>} />
                 <Route path="/admin/coupons" element={<AdminShellLazy><AdminCoupons /></AdminShellLazy>} />
+                <Route path="/admin/categories" element={<AdminShellLazy><AdminCategories /></AdminShellLazy>} />
                 <Route path="/admin/customers" element={<AdminShellLazy><AdminCustomers /></AdminShellLazy>} />
                 <Route path="/admin/tickets" element={<AdminShellLazy><AdminTickets /></AdminShellLazy>} />
                 <Route path="/admin/reviews" element={<AdminShellLazy><AdminReviews /></AdminShellLazy>} />
