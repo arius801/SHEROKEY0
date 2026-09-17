@@ -31,7 +31,9 @@ const DAY = 86400000;
 /* ------------------------------------------------------------------ */
 export const PROD_BUILD = import.meta.env.PROD;
 export const API_URL = ((import.meta.env.VITE_API_URL as string | undefined) ?? "").replace(/\/+$/, "");
-export const SERVER_MODE = PROD_BUILD; // PROD ⇒ server API is mandatory
+// SERVER_MODE = true only if PROD_BUILD AND VITE_API_URL is set
+// Otherwise, use sandbox mode with seed data
+export const SERVER_MODE = PROD_BUILD && API_URL.length > 0;
 
 let csrfToken: string | null = null; // memory-only CSRF double-submit token from /api/bootstrap
 
