@@ -79,3 +79,43 @@ describe("provider status honesty", () => {
     expect(mirHealth()).toBe("NOT_CONFIGURED");
   });
 });
+
+/* ---------------------------------------------------------------- PayPal IDOR protection (§3) */
+describe("PayPal IDOR protection — ownership check BEFORE capture", () => {
+  it("capturePayPalOrder verifies ownership BEFORE calling PayPal /capture endpoint", async () => {
+    // This test verifies the code structure, not runtime behavior
+    // The actual fix ensures: GET order details → extract reference_id → fetch from DB → 
+    // verify ownership → verify status/amount/currency → ONLY THEN execute capture
+    
+    // Read the source code to verify the order of operations
+    const fs = await import("fs");
+    const path = await import("path");
+    const paymentsPath = path.join(process.cwd(), "server/payments.ts");
+    const sourceCode = fs.readFileSync(paymentsPath, "utf-8");
+    
+    // Find the capturePayPalOrder function
+    const captureFnMatch = sourceCode.match(/export async function capturePayPalOrder[\s\S]*?^}/m);
+    expect(captureFnMatch).toBeTruthy();
+    
+    const captureFn = captureFnMatch![0];
+    
+    // Verify that ownership check appears BEFORE the capture POST request
+    const ownershipCheckPos = captureFn.indexOf("o.customerId !== userId");
+    const capturePostPos = captureFn.indexOf("/capture");
+    
+    // The ownership check must appear BEFORE any /capture endpoint call
+    expect(ownershipCheckPos).toBeGreaterThan(-1);
+    expect(capturePostPos).toBeGreaterThan(-1);
+    expect(ownershipCheckPos).toBeLessThan(capturePostPos);
+    
+    // Verify that GET order details appears BEFORE capture
+    const getOrderPos = captureFn.indexOf("method: \"GET\"");
+    expect(getOrderPos).toBeGreaterThan(-1);
+    expect(getOrderPos).toBeLessThan(capturePostPos);
+    
+    // Verify that reference_id extraction appears BEFORE capture
+    const referenceIdPos = captureFn.indexOf("reference_id");
+    expect(referenceIdPos).toBeGreaterThan(-1);
+    expect(referenceIdPos).toBeLessThan(capturePostPos);
+  });
+});

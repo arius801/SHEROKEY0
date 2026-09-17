@@ -135,37 +135,78 @@ export async function createPayPalOrder(orderId: string, totalMinor: number, cur
   return { paypalOrderId: body.id, approveUrl: approve };
 }
 
-/** Server-side capture AFTER customer approval — then full server verification.
- *  IDOR protection: userId must match order.customerId before capture is executed. */
+/** Server-side capture AFTER customer approval — with PRE-CAPTURE ownership verification.
+ *  IDOR protection: ownership is verified BEFORE any PayPal API call. */
 export async function capturePayPalOrder(paypalOrderId: string, userId: string): Promise<{ orderId: string | null }> {
   const token = await paypalToken();
-  const res = await fetch(`${paypalBase()}/v2/checkout/orders/${paypalOrderId}/capture`, {
-    method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, Prefer: "return=minimal" },
-  });
-  const body = (await res.json()) as {
-    id: string; status: string;
-    purchase_units?: { reference_id?: string; payments?: { captures?: { id: string; amount?: { currency_code: string; value: string }; status: string }[] } }[];
-  };
-  if (body.status !== "COMPLETED") throw new ApiError("PAYPAL_CAPTURE_FAILED", 402);
-  const unit = body.purchase_units?.[0];
-  const capture = unit?.payments?.captures?.[0];
-  const orderId = unit?.reference_id ?? null;
-  if (!orderId || !capture) throw new ApiError("PAYPAL_VERIFICATION_FAILED", 400);
-
-  // amount/currency/order verification against the server-priced order (§11/§15)
   const d = requireDb();
+
+  // STEP 1: Get PayPal order details WITHOUT capture (GET request)
+  const getOrderRes = await fetch(`${paypalBase()}/v2/checkout/orders/${paypalOrderId}`, {
+    method: "GET", headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+  });
+  if (!getOrderRes.ok) throw new ApiError("PAYPAL_ORDER_FETCH_FAILED", 502);
+  const paypalOrder = (await getOrderRes.json()) as {
+    id: string; status: string;
+    purchase_units?: { reference_id?: string; amount?: { currency_code?: string; value?: string } }[];
+  };
+
+  // STEP 2: Extract SHEROKEY order ID from PayPal reference_id
+  const orderId = paypalOrder.purchase_units?.[0]?.reference_id ?? null;
+  if (!orderId) throw new ApiError("PAYPAL_NO_REFERENCE_ID", 400);
+
+  // STEP 3: Fetch SHEROKEY order from PostgreSQL
   const o = (await d.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
   if (!o) throw new ApiError("PAYPAL_ORDER_MISMATCH", 400);
 
-  // IDOR protection: verify the order belongs to the authenticated user
+  // STEP 4: IDOR protection — verify ownership BEFORE any capture
   if (o.customerId !== userId) throw new ApiError("PAYPAL_ORDER_OWNERSHIP_MISMATCH", 403);
 
-  if (capture.amount?.currency_code !== o.currency) throw new ApiError("PAYPAL_CURRENCY_MISMATCH", 400);
-  if (Math.round(parseFloat(capture.amount!.value) * 100) !== o.totalMinor) throw new ApiError("PAYPAL_AMOUNT_MISMATCH", 400);
+  // STEP 5: Verify order status allows payment
+  if (o.paymentStatus !== "PENDING" && o.paymentStatus !== "REQUIRES_ACTION") {
+    throw new ApiError("PAYPAL_ORDER_STATUS_INVALID", 400);
+  }
 
+  // STEP 6: Verify PayPal order is linked to this SHEROKEY order
+  if (paypalOrder.status !== "APPROVED") {
+    throw new ApiError("PAYPAL_ORDER_NOT_APPROVED", 400);
+  }
+
+  // STEP 7: Verify amount and currency BEFORE capture
+  const paypalAmount = paypalOrder.purchase_units?.[0]?.amount;
+  if (!paypalAmount?.currency_code || !paypalAmount?.value) {
+    throw new ApiError("PAYPAL_AMOUNT_MISSING", 400);
+  }
+  if (paypalAmount.currency_code !== o.currency) {
+    throw new ApiError("PAYPAL_CURRENCY_MISMATCH", 400);
+  }
+  if (Math.round(parseFloat(paypalAmount.value) * 100) !== o.totalMinor) {
+    throw new ApiError("PAYPAL_AMOUNT_MISMATCH", 400);
+  }
+
+  // STEP 8: ONLY NOW execute PayPal Capture (all checks passed)
+  const captureRes = await fetch(`${paypalBase()}/v2/checkout/orders/${paypalOrderId}/capture`, {
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, Prefer: "return=minimal" },
+  });
+  const captureBody = (await captureRes.json()) as {
+    id: string; status: string;
+    purchase_units?: { reference_id?: string; payments?: { captures?: { id: string; amount?: { currency_code: string; value: string }; status: string }[] } }[];
+  };
+  if (captureBody.status !== "COMPLETED") throw new ApiError("PAYPAL_CAPTURE_FAILED", 402);
+
+  const unit = captureBody.purchase_units?.[0];
+  const capture = unit?.payments?.captures?.[0];
+  if (!capture) throw new ApiError("PAYPAL_CAPTURE_MISSING", 400);
+
+  // STEP 9: Verify capture response
+  if (capture.status !== "COMPLETED") throw new ApiError("PAYPAL_CAPTURE_NOT_COMPLETED", 402);
+  if (capture.amount?.currency_code !== o.currency) throw new ApiError("PAYPAL_CAPTURE_CURRENCY_MISMATCH", 400);
+  if (Math.round(parseFloat(capture.amount!.value) * 100) !== o.totalMinor) throw new ApiError("PAYPAL_CAPTURE_AMOUNT_MISMATCH", 400);
+
+  // STEP 10: Record provider event and trigger fulfillment
   await ingestProviderEvent({
     provider: "PAYPAL", eventId: `capture:${capture.id}`, eventType: "capture.completed",
-    payloadHash: createHash("sha256").update(JSON.stringify({ id: body.id, capture: capture.id, amount: capture.amount })).digest("hex"),
+    payloadHash: createHash("sha256").update(JSON.stringify({ id: captureBody.id, capture: capture.id, amount: capture.amount })).digest("hex"),
     extract: () => ({ orderId, amountMinor: o.totalMinor, currency: o.currency, providerPaymentId: capture!.id }),
     successTypes: ["capture.completed"], failureTypes: [],
   });
@@ -214,14 +255,24 @@ export interface MirProviderAdapter {
 }
 
 /** Returns null when no MIR-compatible acquirer is configured — the storefront then
- *  honestly displays "Not configured" (§12). Never a fake. */
+ *  honestly displays "Not configured" (§12). Never a fake.
+ *  
+ *  NOTE: This is a PLACEHOLDER adapter. No real MIR acquirer is currently integrated.
+ *  The signature algorithm below is NOT production-ready and must be replaced with
+ *  the actual algorithm documented by the chosen MIR acquirer before going live.
+ *  mirHealth() returns NOT_CONFIGURED regardless of credentials. */
 export async function mirAdapter(): Promise<MirProviderAdapter | null> {
   const apiKey = process.env.MIR_PROVIDER_API_KEY;
   const secret = process.env.MIR_PROVIDER_SECRET;
   const base = process.env.MIR_PROVIDER_BASE_URL;
   const merchantId = process.env.MIR_MERCHANT_ID;
   if (!apiKey || !secret || !base || !merchantId) return null;
-  const sign = (payload: string) => createHash("sha256").update(`${payload}${secret}`).digest("hex"); // HMAC scheme per acquirer docs
+  
+  // WARNING: This is a placeholder signature algorithm. Real MIR acquirers require
+  // specific HMAC algorithms documented in their API specs. This MUST be replaced
+  // with the actual algorithm before production use.
+  const sign = (payload: string) => createHash("sha256").update(`${payload}${secret}`).digest("hex");
+  
   return {
     async createPayment(orderId, totalMinor, number) {
       const res = await fetch(`${base}/payments`, {
