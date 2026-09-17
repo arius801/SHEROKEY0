@@ -100,14 +100,14 @@ export function CartPage() {
 }
 
 /* ================= CHECKOUT ================= */
-const fmtCard = (v: string) => v.replace(/\D/g, "").slice(0, 16).replace(/(\d{4})(?=\d)/g, "$1 ");
-const fmtExp = (v: string) => { const d = v.replace(/\D/g, "").slice(0, 4); return d.length > 2 ? d.slice(0, 2) + "/" + d.slice(2) : d; };
+// fmtCard and fmtExp removed - no longer handling raw card data
 
 export function CheckoutPage() {
   const { db, t, money, user, ui, fmt } = useApp();
   const nav = useNavigate();
   const [method, setMethod] = useState<PayMethod>("CARD_INTL");
-  const [card, setCard] = useState({ num: "", exp: "", cvc: "", name: "" });
+  // Card data removed - using hosted checkout only (Stripe/PayPal/MIR)
+  // PAN/CVC never touches our servers
   const [code, setCode] = useState(sessionStorage.getItem(COUPON_KEY) ?? "");
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<null | "placing" | "processing">(null);
@@ -179,9 +179,7 @@ export function CheckoutPage() {
   const pay = async () => {
     setFailed(null);
     if (chosen.reason) { setFailed(t(chosen.reason === "currency" ? "co.providerCur" : chosen.reason === "down" ? "co.providerDown" : "co.providerOff", { cur: totals.currency })); return; }
-    const isCard = method !== "PAYPAL";
     try {
-      if (isCard && card.num.replace(/\s/g, "").length < 16) { setFailed(`${t("co.cardNum")} — ${method === "CARD_MIR" ? "2200 0000 0000 0004" : "4242 4242 4242 4242"}`); return; }
       setStage("placing");
       const coupon = code.trim() || sessionStorage.getItem(COUPON_KEY);
       let orderId = pendingOrderId;
@@ -204,7 +202,7 @@ export function CheckoutPage() {
       }
       if (!orderId) return;
       setStage("processing");
-      await api.confirmPayment(orderId, isCard ? card.num : undefined);
+      await api.confirmPayment(orderId);
       sessionStorage.removeItem(COUPON_KEY);
       nav(`/order/${orderId}`);
     } catch (e) {
@@ -277,25 +275,17 @@ export function CheckoutPage() {
               })}
             </div>
 
-            {method !== "PAYPAL" ? (
-              <div className="space-y-4 anim-fade">
-                <Field label={t("co.cardNum")}>
-                  <Input value={card.num} onChange={(e) => setCard({ ...card, num: fmtCard(e.target.value) })} placeholder="4242 4242 4242 4242" dir="ltr" inputMode="numeric" autoComplete="cc-number" />
-                </Field>
-                <div className="grid grid-cols-3 gap-4">
-                  <Field label={t("co.cardExp")}><Input value={card.exp} onChange={(e) => setCard({ ...card, exp: fmtExp(e.target.value) })} placeholder="12/28" dir="ltr" /></Field>
-                  <Field label={t("co.cardCvc")}><Input value={card.cvc} onChange={(e) => setCard({ ...card, cvc: e.target.value.replace(/\D/g, "").slice(0, 4) })} placeholder="123" dir="ltr" /></Field>
-                  <Field label={t("co.cardName")}><Input value={card.name} onChange={(e) => setCard({ ...card, name: e.target.value })} placeholder="A. CUSTOMER" /></Field>
-                </div>
-                {chosenCfg.mode === "TEST" && (
-                  <p className="text-[11.5px] text-ember-400 font-bold leading-relaxed bg-ember-500/8 border border-ember-500/25 rounded-lg px-3.5 py-2.5" dir="ltr">
-                    {method === "CARD_MIR" ? t("co.mirTest") : t("co.testMode")} · {chosen.provider}
-                  </p>
-                )}
-              </div>
-            ) : (
-              <p className="text-[13px] text-dim leading-relaxed anim-fade flex gap-2.5 items-start"><IInfo14 /> {t("co.secureNote")}</p>
-            )}
+            <div className="space-y-4 anim-fade">
+              <p className="text-[13px] text-dim leading-relaxed flex gap-2.5 items-start">
+                <IShield size={14} className="text-volt-400 shrink-0 mt-0.5" />
+                {t("co.secureNote")}
+              </p>
+              {chosenCfg.mode === "TEST" && (
+                <p className="text-[11.5px] text-ember-400 font-bold leading-relaxed bg-ember-500/8 border border-ember-500/25 rounded-lg px-3.5 py-2.5" dir="ltr">
+                  {method === "CARD_MIR" ? t("co.mirTest") : t("co.testMode")} · {chosen.provider}
+                </p>
+              )}
+            </div>
           </section>
         </div>
 

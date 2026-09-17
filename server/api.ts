@@ -240,8 +240,12 @@ const routes: Record<string, Handler> = {
     const rows = await d.select({ key: licenseKeys.key, productId: licenseKeys.productId, deliveredAt: licenseKeys.deliveredAt, orderId: licenseKeys.orderId })
       .from(licenseKeys)
       .innerJoin(orders, eq(orders.id, licenseKeys.orderId))
-      .where(eq(licenseKeys.customerId, user.id));
-    return { status: 200, body: rows.filter((_, i) => true).map((r) => r) };
+      .where(and(
+        eq(licenseKeys.customerId, user.id),
+        eq(orders.paymentStatus, "PAID"),
+        eq(licenseKeys.status, "DELIVERED")
+      ));
+    return { status: 200, body: rows };
   },
   "POST /api/account/profile": async (ctx, user) => {
     if (!user) throw new ApiError("e.session", 401);
