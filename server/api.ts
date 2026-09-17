@@ -432,9 +432,9 @@ const routes: Record<string, Handler> = {
         featured: z.boolean(),
         isNew: z.boolean(),
         active: z.boolean(),
-        image: z.string().url(),
-        seoTitle: z.string().max(200),
-        seoDescription: z.string().max(500),
+        image: z.string().url().or(z.string().length(0)).default(""),
+        seoTitle: z.string().max(200).default(""),
+        seoDescription: z.string().max(500).default(""),
       }),
       ctx.body
     );
@@ -467,7 +467,7 @@ const routes: Record<string, Handler> = {
         featured: z.boolean().optional(),
         isNew: z.boolean().optional(),
         active: z.boolean().optional(),
-        image: z.string().url().optional(),
+        image: z.string().url().or(z.string().length(0)).optional(),
         seoTitle: z.string().max(200).optional(),
         seoDescription: z.string().max(500).optional(),
       }),

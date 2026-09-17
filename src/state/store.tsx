@@ -1407,6 +1407,12 @@ const serverRoutes: Record<string, (...args: never[]) => Promise<unknown> | unkn
     await serverFetch(`/api/admin/coupons/${code}`, { method: "DELETE" });
     await store.refresh();
   },
+  toggleCoupon: async (code: string) => {
+    const c = store.db.coupons.find((x) => x.code === code);
+    if (!c) throw new ApiError("e.notFound");
+    await serverFetch(`/api/admin/coupons/${code}`, { method: "PUT", body: { active: !c.active } });
+    await store.refresh();
+  },
 
   /* admin: users/roles (§1/§16) */
   changeRole: async (userId: string, role: Role) => {
