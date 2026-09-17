@@ -46,9 +46,10 @@ export interface PaymentRouting {
 }
 
 export const DEFAULT_PROVIDERS: PaymentProviders = {
-  STRIPE: { enabled: true, mode: "TEST", currencies: ["USD", "EUR", "SAR"], operational: true, merchantMasked: "acct_••••7Q2F" },
-  PAYPAL: { enabled: true, mode: "TEST", currencies: ["USD", "EUR", "SAR", "RUB"], operational: true, merchantMasked: "A•••@sherokey.com" },
-  MIR_ACQUIRER: { enabled: true, mode: "TEST", currencies: ["RUB"], operational: true, merchantMasked: "MIR-••••0412" },
+  // operational: false — frontend will not consider these ready until server confirms via /api/bootstrap
+  STRIPE: { enabled: false, mode: "TEST", currencies: ["USD", "EUR", "SAR"], operational: false, merchantMasked: "acct_••••7Q2F" },
+  PAYPAL: { enabled: false, mode: "TEST", currencies: ["USD", "EUR", "SAR", "RUB"], operational: false, merchantMasked: "A•••@sherokey.com" },
+  MIR_ACQUIRER: { enabled: false, mode: "TEST", currencies: ["RUB"], operational: false, merchantMasked: "MIR-••••0412" },
 };
 
 export const DEFAULT_ROUTING: PaymentRouting = { CARD_INTL: "STRIPE", CARD_MIR: "MIR_ACQUIRER", PAYPAL: "PAYPAL" };

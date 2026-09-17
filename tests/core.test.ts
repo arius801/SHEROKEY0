@@ -73,11 +73,19 @@ describe("webhook event signing", () => {
 /* ---------------------------------------------------------------- provider availability gating (§7/§12/§20) */
 describe("checkout provider availability", () => {
   const settings = (over: Partial<DB["settings"]> = {}) =>
-    ({ fx: { USD: 1, EUR: 0.92, SAR: 3.75, RUB: 96 }, providers: DEFAULT_PROVIDERS, routing: DEFAULT_ROUTING, ...over }) as DB["settings"];
+    ({ fx: { USD: 1, EUR: 0.92, SAR: 3.75, RUB: 96 }, providers: { ...DEFAULT_PROVIDERS }, routing: DEFAULT_ROUTING, ...over }) as DB["settings"];
 
-  it("MIR is available only for RUB", () => {
-    expect(availableMethods(settings(), "RUB").find((m) => m.method === "CARD_MIR")!.reason).toBeNull();
-    expect(availableMethods(settings(), "USD").find((m) => m.method === "CARD_MIR")!.reason).toBe("currency");
+  it("MIR is available only for RUB when operational", () => {
+    const s = settings();
+    // Make MIR operational for this test
+    s.providers!.MIR_ACQUIRER = { ...s.providers!.MIR_ACQUIRER, enabled: true, operational: true };
+    expect(availableMethods(s, "RUB").find((m) => m.method === "CARD_MIR")!.reason).toBeNull();
+    expect(availableMethods(s, "USD").find((m) => m.method === "CARD_MIR")!.reason).toBe("currency");
+  });
+  it("MIR is NOT_CONFIGURED by default (no real acquirer)", () => {
+    // DEFAULT_PROVIDERS now has enabled: false, operational: false
+    const result = availableMethods(settings(), "RUB").find((m) => m.method === "CARD_MIR");
+    expect(result!.reason).toBe("disabled"); // enabled: false → disabled
   });
   it("a disabled provider never appears payable", () => {
     const s = settings();
@@ -86,12 +94,16 @@ describe("checkout provider availability", () => {
   });
   it("LIVE mode without server credentials reports NOT CONFIGURED, never Operational", () => {
     const s = settings();
+    // Default is enabled: false, operational: false, so NOT_CONFIGURED
+    expect(providerStatus(s.providers!.STRIPE)).toBe("NOT_CONFIGURED");
+    // Enable and set operational to true for TEST mode
+    s.providers!.STRIPE = { ...s.providers!.STRIPE, enabled: true, operational: true };
     s.providers!.STRIPE.mode = "LIVE";
-    expect(providerStatus(s.providers!.STRIPE)).toBe("NOT_CONFIGURED");
+    expect(providerStatus(s.providers!.STRIPE)).toBe("NOT_CONFIGURED"); // LIVE without real credentials
     s.providers!.STRIPE.mode = "TEST";
-    expect(providerStatus(s.providers!.STRIPE)).toBe("TEST_READY");
+    expect(providerStatus(s.providers!.STRIPE)).toBe("TEST_READY"); // TEST + operational = TEST_READY
     s.providers!.STRIPE.operational = false;
-    expect(providerStatus(s.providers!.STRIPE)).toBe("NOT_CONFIGURED");
+    expect(providerStatus(s.providers!.STRIPE)).toBe("NOT_CONFIGURED"); // operational: false = NOT_CONFIGURED
   });
 });
 

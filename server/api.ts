@@ -222,7 +222,7 @@ const routes: Record<string, Handler> = {
   "POST /api/paypal/capture": async (ctx, user) => {
     if (!user) throw new ApiError("e.session", 401);
     const { paypalOrderId } = z.object({ paypalOrderId: z.string().min(5) }).parse(JSON.parse(ctx.body));
-    const r = await capturePayPalOrder(paypalOrderId); // server capture + verification; PAID only from here/webhook
+    const r = await capturePayPalOrder(paypalOrderId, user.id); // IDOR protection: userId verified inside
     return { status: 200, body: r };
   },
 

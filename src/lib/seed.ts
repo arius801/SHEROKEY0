@@ -445,7 +445,13 @@ export async function buildSeed(): Promise<DB> {
     fx: { USD: 1, EUR: 0.9234, SAR: 3.75, RUB: 96.42 },
     stripeEnabled: true, paypalEnabled: true, taxRatePct: 0, maintenanceMode: false,
     emailProvider: "RESEND", emailFrom: "SHEROKEY <no-reply@sherokey.com>", requireReviewApproval: true,
-    providers: DEFAULT_PROVIDERS, routing: DEFAULT_ROUTING,
+    // Sandbox mode: enable TEST providers for demo/development
+    providers: {
+      STRIPE: { enabled: true, mode: "TEST", currencies: ["USD", "EUR", "SAR"], operational: true, merchantMasked: "acct_••••7Q2F" },
+      PAYPAL: { enabled: true, mode: "TEST", currencies: ["USD", "EUR", "SAR", "RUB"], operational: true, merchantMasked: "A•••@sherokey.com" },
+      MIR_ACQUIRER: { enabled: false, mode: "TEST", currencies: ["RUB"], operational: false, merchantMasked: "MIR-••••0412" },
+    },
+    routing: DEFAULT_ROUTING,
   };
 
   return {

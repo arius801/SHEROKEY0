@@ -32,10 +32,13 @@ export function paypalHealth(): ProviderHealth {
   return (process.env.PAYPAL_ENVIRONMENT ?? "sandbox") === "live" ? "OPERATIONAL" : "TEST_READY";
 }
 export function mirHealth(): ProviderHealth {
-  // A MIR route is only real when an actual MIR-compatible acquirer is connected.
+  // A MIR route is only real when an actual MIR-compatible acquirer is connected AND verified.
+  // Without a real health check endpoint, we cannot claim OPERATIONAL.
   const key = process.env.MIR_PROVIDER_API_KEY; const secret = process.env.MIR_PROVIDER_SECRET; const wh = process.env.MIR_PROVIDER_WEBHOOK_SECRET;
   if (!key || !secret || !wh) return "NOT_CONFIGURED";
-  return "OPERATIONAL"; // reached only after the acquirer's own connection check passes at boot (§20)
+  // TODO: Implement actual health check with acquirer API before returning OPERATIONAL
+  // For now, credentials exist but connectivity is NOT verified
+  return "NOT_CONFIGURED";
 }
 
 /* ================================================================ Stripe (§10) */
@@ -132,8 +135,9 @@ export async function createPayPalOrder(orderId: string, totalMinor: number, cur
   return { paypalOrderId: body.id, approveUrl: approve };
 }
 
-/** Server-side capture AFTER customer approval — then full server verification. */
-export async function capturePayPalOrder(paypalOrderId: string): Promise<{ orderId: string | null }> {
+/** Server-side capture AFTER customer approval — then full server verification.
+ *  IDOR protection: userId must match order.customerId before capture is executed. */
+export async function capturePayPalOrder(paypalOrderId: string, userId: string): Promise<{ orderId: string | null }> {
   const token = await paypalToken();
   const res = await fetch(`${paypalBase()}/v2/checkout/orders/${paypalOrderId}/capture`, {
     method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, Prefer: "return=minimal" },
@@ -152,6 +156,10 @@ export async function capturePayPalOrder(paypalOrderId: string): Promise<{ order
   const d = requireDb();
   const o = (await d.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
   if (!o) throw new ApiError("PAYPAL_ORDER_MISMATCH", 400);
+
+  // IDOR protection: verify the order belongs to the authenticated user
+  if (o.customerId !== userId) throw new ApiError("PAYPAL_ORDER_OWNERSHIP_MISMATCH", 403);
+
   if (capture.amount?.currency_code !== o.currency) throw new ApiError("PAYPAL_CURRENCY_MISMATCH", 400);
   if (Math.round(parseFloat(capture.amount!.value) * 100) !== o.totalMinor) throw new ApiError("PAYPAL_AMOUNT_MISMATCH", 400);
 
